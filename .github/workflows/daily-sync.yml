@@ -1,0 +1,43 @@
+name: Daily Smartlead sync
+
+on:
+  schedule:
+    # 01:30 UTC = 07:00 IST, every day
+    - cron: "30 1 * * *"
+  workflow_dispatch: {}   # lets you run it manually from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: smartlead-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Fetch Smartlead analytics
+        env:
+          SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+          DASHBOARD_TIME_ZONE: Asia/Kolkata
+        run: node scripts/fetch-smartlead.mjs
+
+      - name: Commit updated data
+        run: |
+          git config user.name "smartlead-sync-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add public/data
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "data: Smartlead sync $(TZ=Asia/Kolkata date +%F)"
+            git push
+          fi

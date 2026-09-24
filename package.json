@@ -1,0 +1,13 @@
+{
+  "name": "smartlead-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Daily Smartlead.ai email analytics dashboard (static, Vercel-hosted).",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "sync": "node scripts/fetch-smartlead.mjs",
+    "demo": "node scripts/make-demo-data.mjs",
+    "dev": "npx --yes serve public -l 3000"
+  }
+}
