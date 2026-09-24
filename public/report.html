@@ -1,0 +1,74 @@
+<!-- public/report.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Daily report · Outbound email</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📬</text></svg>" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="page">
+    <nav class="tabs" aria-label="Pages">
+      <a href="/">Overview</a>
+      <a href="/report.html" aria-current="page">Daily report</a>
+    </nav>
+
+    <header class="masthead">
+      <div>
+        <h1 id="report-title">Daily report</h1>
+        <p class="sync">
+          <span class="live-dot" id="live-dot" aria-hidden="true"></span>
+          <span id="sync-status" aria-live="polite">Loading…</span>
+        </p>
+      </div>
+      <div class="day-picker">
+        <button type="button" class="ghost" id="prev-day" aria-label="Previous day">‹ Prev</button>
+        <label class="visually-hidden" for="day">Report date</label>
+        <input type="date" id="day" />
+        <button type="button" class="ghost" id="next-day" aria-label="Next day">Next ›</button>
+      </div>
+    </header>
+
+    <p class="notice" id="notice" hidden></p>
+
+    <section class="day-summary" aria-label="Day totals">
+      <dl id="summary"></dl>
+      <p class="panel-sub" id="summary-note"></p>
+    </section>
+
+    <section class="panel" aria-labelledby="replied-title">
+      <div class="panel-head">
+        <h2 id="replied-title">Replied <span class="count" id="replied-count"></span></h2>
+        <button type="button" id="export-csv" class="ghost">Export CSV</button>
+      </div>
+      <div id="replied-list" class="lead-list"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="clicked-title">
+      <div class="panel-head">
+        <h2 id="clicked-title">Clicked <span class="count" id="clicked-count"></span></h2>
+      </div>
+      <div id="clicked-list" class="lead-list"></div>
+    </section>
+
+    <section class="panel" aria-labelledby="opened-title">
+      <div class="panel-head">
+        <h2 id="opened-title">Opened <span class="count" id="opened-count"></span></h2>
+        <p class="panel-sub">Smartlead doesn't share the exact time of each open, so this lists leads active that day with the email they opened.</p>
+      </div>
+      <div id="opened-list" class="lead-list"></div>
+    </section>
+
+    <footer class="foot">
+      A day runs midnight to midnight India time. Totals come from the daily snapshots; the lead lists come live from Smartlead.
+    </footer>
+  </div>
+
+  <script src="/report.js"></script>
+</body>
+</html>
