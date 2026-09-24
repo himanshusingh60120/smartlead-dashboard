@@ -4,12 +4,22 @@
   "installCommand": "",
   "outputDirectory": "public",
   "functions": {
-    "api/stats.js": { "maxDuration": 60 }
+    "api/stats.js": {
+      "maxDuration": 60
+    },
+    "api/report.js": {
+      "maxDuration": 60
+    }
   },
   "headers": [
     {
       "source": "/data/(.*)",
-      "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }]
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=0, must-revalidate"
+        }
+      ]
     }
   ]
 }
