@@ -3,6 +3,9 @@
   "buildCommand": "",
   "installCommand": "",
   "outputDirectory": "public",
+  "functions": {
+    "api/stats.js": { "maxDuration": 60 }
+  },
   "headers": [
     {
       "source": "/data/(.*)",
