@@ -1,3 +1,4 @@
+<!-- public/index.html -->
 <!doctype html>
 <html lang="en">
 <head>
@@ -15,7 +16,11 @@
     <header class="masthead">
       <div>
         <h1>Outbound email report</h1>
-        <p class="sync" id="sync-status">Loading data…</p>
+        <p class="sync">
+          <span class="live-dot" id="live-dot" aria-hidden="true"></span>
+          <span id="sync-status" aria-live="polite">Loading live data…</span>
+          <button type="button" id="refresh" class="link-btn">Refresh</button>
+        </p>
       </div>
       <div class="range" role="group" aria-label="Date range">
         <button type="button" data-range="7">7 days</button>
