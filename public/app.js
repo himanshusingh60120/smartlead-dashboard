@@ -50,7 +50,7 @@
       }
     }
     snapshots = ((await historyP).snapshots || []).sort((a, b) => a.date.localeCompare(b.date));
-    deltas = buildDeltas(snapshots, data.live ? data.campaigns : null);
+    deltas = buildDeltas(snapshots, data.live ? data.campaigns : null, data.campaigns);
 
     loading = false;
     $("refresh").disabled = false;
@@ -95,8 +95,10 @@
   /**
    * Snapshot for day D = totals at the start of D.
    * Activity on day D = snapshot(D+1) − snapshot(D), or live − snapshot(D) for today.
+   * Campaigns created on the day history starts also get everything they did
+   * before that first snapshot, so day one isn't undercounted.
    */
-  function buildDeltas(snaps, liveCampaigns) {
+  function buildDeltas(snaps, liveCampaigns, allCampaigns) {
     const points = [...snaps];
     if (liveCampaigns) {
       points.push({ date: null, campaigns: Object.fromEntries(liveCampaigns.map((c) => [String(c.id), c])) });
@@ -117,7 +119,29 @@
       }
       for (const [id, c] of Object.entries(cur.campaigns)) lastSeen[id] = c;
     }
+
+    // Day-one backfill
+    const first = snaps[0];
+    if (first) {
+      const created = Object.fromEntries((allCampaigns || []).map((c) => [String(c.id), localDate(c.created_at)]));
+      let day = out.find((d) => d.date === first.date);
+      if (!day) { day = { date: first.date, campaigns: {} }; out.unshift(day); }
+      for (const [id, c] of Object.entries(first.campaigns)) {
+        if (!created[id] || created[id] < first.date) continue;
+        const d = (day.campaigns[id] ||= Object.fromEntries(METRICS.map((m) => [m, 0])));
+        for (const m of METRICS) d[m] += c[m] || 0;
+      }
+      if (!Object.keys(day.campaigns).length) out.splice(out.indexOf(day), 1);
+    }
     return out;
+  }
+
+  // YYYY-MM-DD of a timestamp in the dashboard's time zone (IST)
+  function localDate(ts) {
+    if (!ts) return null;
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return String(ts).slice(0, 10);
+    return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(d);
   }
 
   // ---------- One-time setup ----------
