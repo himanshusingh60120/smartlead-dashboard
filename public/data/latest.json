@@ -1,8 +1,46 @@
 {
-  "updated_at": "2026-09-24T11:19:59.902Z",
-  "date": "2026-09-24",
+  "updated_at": "2026-09-24T21:42:48.394Z",
+  "date": "2026-09-25",
   "time_zone": "Asia/Kolkata",
   "campaigns": [
+    {
+      "id": 4017484,
+      "name": "Email Campaign 1010 - Asia/Seoul",
+      "status": "DRAFTED",
+      "created_at": "2026-09-24T13:05:19.547Z",
+      "client": null,
+      "plain_text": false,
+      "sent": 0,
+      "unique_sent": 0,
+      "opened": 0,
+      "unique_opened": 0,
+      "clicked": 0,
+      "unique_clicked": 0,
+      "replied": 0,
+      "bounced": 0,
+      "unsubscribed": 0,
+      "leads_total": 1,
+      "leads_interested": 0
+    },
+    {
+      "id": 4016793,
+      "name": "Email Campaign 1010 - Asia/Tokyo",
+      "status": "ACTIVE",
+      "created_at": "2026-09-24T11:28:56.667Z",
+      "client": null,
+      "plain_text": false,
+      "sent": 0,
+      "unique_sent": 0,
+      "opened": 0,
+      "unique_opened": 0,
+      "clicked": 0,
+      "unique_clicked": 0,
+      "replied": 0,
+      "bounced": 0,
+      "unsubscribed": 0,
+      "leads_total": 1,
+      "leads_interested": 0
+    },
     {
       "id": 4015932,
       "name": "Email Campaign 1010 - Asia/Riyadh",
@@ -12,8 +50,8 @@
       "plain_text": false,
       "sent": 4,
       "unique_sent": 4,
-      "opened": 2,
-      "unique_opened": 2,
+      "opened": 3,
+      "unique_opened": 3,
       "clicked": 0,
       "unique_clicked": 0,
       "replied": 0,
@@ -48,8 +86,8 @@
       "created_at": "2026-09-24T07:39:53.306Z",
       "client": null,
       "plain_text": false,
-      "sent": 11,
-      "unique_sent": 11,
+      "sent": 18,
+      "unique_sent": 18,
       "opened": 0,
       "unique_opened": 0,
       "clicked": 0,
@@ -57,7 +95,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 13,
+      "leads_total": 20,
       "leads_interested": 0
     },
     {
@@ -86,8 +124,8 @@
       "created_at": "2026-09-24T07:39:16.103Z",
       "client": null,
       "plain_text": false,
-      "sent": 6,
-      "unique_sent": 6,
+      "sent": 8,
+      "unique_sent": 8,
       "opened": 0,
       "unique_opened": 0,
       "clicked": 0,
@@ -95,7 +133,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 6,
+      "leads_total": 8,
       "leads_interested": 0
     },
     {
@@ -105,8 +143,8 @@
       "created_at": "2026-09-24T07:38:00.253Z",
       "client": null,
       "plain_text": false,
-      "sent": 12,
-      "unique_sent": 12,
+      "sent": 15,
+      "unique_sent": 15,
       "opened": 0,
       "unique_opened": 0,
       "clicked": 0,
@@ -114,7 +152,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 13,
+      "leads_total": 15,
       "leads_interested": 0
     },
     {
@@ -124,16 +162,16 @@
       "created_at": "2026-09-24T07:37:27.785Z",
       "client": null,
       "plain_text": false,
-      "sent": 0,
-      "unique_sent": 0,
-      "opened": 0,
-      "unique_opened": 0,
+      "sent": 30,
+      "unique_sent": 30,
+      "opened": 5,
+      "unique_opened": 5,
       "clicked": 0,
       "unique_clicked": 0,
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 58,
+      "leads_total": 120,
       "leads_interested": 0
     },
     {
@@ -145,14 +183,14 @@
       "plain_text": false,
       "sent": 30,
       "unique_sent": 30,
-      "opened": 2,
-      "unique_opened": 2,
+      "opened": 4,
+      "unique_opened": 4,
       "clicked": 0,
       "unique_clicked": 0,
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 57,
+      "leads_total": 92,
       "leads_interested": 0
     },
     {
@@ -162,8 +200,8 @@
       "created_at": "2026-09-24T07:36:38.660Z",
       "client": null,
       "plain_text": false,
-      "sent": 5,
-      "unique_sent": 5,
+      "sent": 8,
+      "unique_sent": 8,
       "opened": 1,
       "unique_opened": 1,
       "clicked": 0,
@@ -171,7 +209,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 9,
+      "leads_total": 12,
       "leads_interested": 0
     },
     {
@@ -209,7 +247,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 4,
+      "leads_total": 5,
       "leads_interested": 0
     },
     {
@@ -219,8 +257,8 @@
       "created_at": "2026-09-24T07:34:46.585Z",
       "client": null,
       "plain_text": false,
-      "sent": 22,
-      "unique_sent": 22,
+      "sent": 30,
+      "unique_sent": 30,
       "opened": 0,
       "unique_opened": 0,
       "clicked": 0,
@@ -228,7 +266,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 23,
+      "leads_total": 30,
       "leads_interested": 0
     },
     {
@@ -238,16 +276,16 @@
       "created_at": "2026-09-24T07:34:34.432Z",
       "client": null,
       "plain_text": false,
-      "sent": 8,
-      "unique_sent": 8,
-      "opened": 0,
-      "unique_opened": 0,
+      "sent": 10,
+      "unique_sent": 10,
+      "opened": 1,
+      "unique_opened": 1,
       "clicked": 0,
       "unique_clicked": 0,
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 9,
+      "leads_total": 10,
       "leads_interested": 0
     },
     {
@@ -266,7 +304,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 127,
+      "leads_total": 180,
       "leads_interested": 0
     },
     {
@@ -276,16 +314,16 @@
       "created_at": "2026-09-24T07:34:06.424Z",
       "client": null,
       "plain_text": false,
-      "sent": 0,
-      "unique_sent": 0,
-      "opened": 0,
-      "unique_opened": 0,
+      "sent": 30,
+      "unique_sent": 30,
+      "opened": 7,
+      "unique_opened": 7,
       "clicked": 0,
       "unique_clicked": 0,
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 318,
+      "leads_total": 490,
       "leads_interested": 0
     },
     {
@@ -304,7 +342,7 @@
       "replied": 0,
       "bounced": 0,
       "unsubscribed": 0,
-      "leads_total": 56,
+      "leads_total": 67,
       "leads_interested": 0
     },
     {
@@ -421,5 +459,6 @@
       "leads_total": 899,
       "leads_interested": 0
     }
-  ]
+  ],
+  "failed": []
 }
