@@ -1,11 +1,17 @@
+// public/app.js
 (() => {
   "use strict";
 
   const METRICS = ["sent", "unique_sent", "unique_opened", "clicked", "replied", "bounced", "unsubscribed"];
+  const AUTO_REFRESH_MS = 5 * 60 * 1000;
+
   const state = { range: "all", sortKey: "sent", sortDir: "desc", search: "", status: "" };
-  let latest = null;
-  let deltas = []; // [{ date, campaigns: { id: {metric: n} } }]
+  let data = null;      // { updated_at, live, campaigns, error? }
+  let snapshots = [];   // daily snapshots from history.json (totals at the start of each day)
+  let deltas = [];      // [{ date, campaigns: { id: { metric: n } } }]
   let chart = null;
+  let loading = false;
+  let timer = null;
 
   const $ = (id) => document.getElementById(id);
   const fmt = new Intl.NumberFormat();
@@ -13,74 +19,121 @@
   const fmtPct = (v) => (v == null ? "–" : `${(v * 100).toFixed(v < 0.1 ? 1 : 0)}%`);
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const titleCase = (s) => String(s || "").toLowerCase().replace(/(^|\s|_)\w/g, (m) => m.toUpperCase()).replace(/_/g, " ");
 
-  async function load() {
+  // ---------- Loading ----------
+
+  async function getJson(url) {
+    const r = await fetch(url, { cache: "no-store" });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `Request failed (${r.status})`);
+    return body;
+  }
+
+  async function load({ fresh = false } = {}) {
+    if (loading) return;
+    loading = true;
+    setStatus("loading", data ? "Refreshing…" : "Loading live data…");
+    $("refresh").disabled = true;
+
+    const historyP = getJson(`/data/history.json?t=${Date.now()}`).catch(() => ({ snapshots: [] }));
     try {
-      const bust = `?t=${Date.now()}`;
-      const [l, h] = await Promise.all([
-        fetch(`/data/latest.json${bust}`).then((r) => r.json()),
-        fetch(`/data/history.json${bust}`).then((r) => r.json()).catch(() => ({ snapshots: [] })),
-      ]);
-      latest = l;
-      deltas = buildDeltas(h.snapshots || []);
-      init();
+      const live = await getJson(`/api/stats${fresh ? `?fresh=${Date.now()}` : ""}`);
+      data = { ...live, live: true };
     } catch (err) {
-      $("sync-status").textContent = "Couldn't load data files. Check that public/data/latest.json exists.";
-      console.error(err);
+      // Live API unavailable: fall back to the last nightly copy.
+      try {
+        const saved = await getJson(`/data/latest.json?t=${Date.now()}`);
+        data = { ...saved, live: false, error: err.message };
+      } catch {
+        data = { campaigns: [], live: false, error: err.message };
+      }
+    }
+    snapshots = ((await historyP).snapshots || []).sort((a, b) => a.date.localeCompare(b.date));
+    deltas = buildDeltas(snapshots, data.live ? data.campaigns : null);
+
+    loading = false;
+    $("refresh").disabled = false;
+    updateStatus();
+    updateNotice();
+    updateControls();
+    render();
+  }
+
+  function setStatus(kind, text) {
+    $("live-dot").dataset.state = kind;
+    $("sync-status").textContent = text;
+  }
+
+  function updateStatus() {
+    const when = data.updated_at ? new Date(data.updated_at) : null;
+    const time = when ? when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "never";
+    if (data.live) {
+      setStatus("live", `Live · updated ${time}`);
+    } else {
+      setStatus("error", `Live data unavailable (${data.error}). Showing saved data from ${time}.`);
     }
   }
 
-  // Turn cumulative daily snapshots into per-day increments.
-  function buildDeltas(snaps) {
-    const sorted = [...snaps].sort((a, b) => a.date.localeCompare(b.date));
-    const lastSeen = {};
+  function updateNotice() {
+    const notes = [];
+    if (!data.campaigns?.length) notes.push("No campaigns found in your Smartlead account yet.");
+    if (data.failed?.length) {
+      const n = data.failed.length;
+      notes.push(`${n} campaign${n > 1 ? "s" : ""} couldn't be loaded this time and ${n > 1 ? "are" : "is"} missing from the totals. Refresh to try again.`);
+    }
+    if (!snapshots.length) {
+      notes.push("Daily trends start after the first nightly snapshot (just after midnight IST). Until then you're seeing all-time totals.");
+    } else if (snapshots.length < 90) {
+      const first = new Date(`${snapshots[0].date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+      notes.push(`Daily history starts ${first}, so longer periods only cover days since then.`);
+    }
+    $("notice").textContent = notes.join(" ");
+    $("notice").hidden = notes.length === 0;
+  }
+
+  /**
+   * Snapshot for day D = totals at the start of D.
+   * Activity on day D = snapshot(D+1) − snapshot(D), or live − snapshot(D) for today.
+   */
+  function buildDeltas(snaps, liveCampaigns) {
+    const points = [...snaps];
+    if (liveCampaigns) {
+      points.push({ date: null, campaigns: Object.fromEntries(liveCampaigns.map((c) => [String(c.id), c])) });
+    }
     const out = [];
-    sorted.forEach((snap, i) => {
-      const day = { date: snap.date, campaigns: {} };
-      for (const [id, cur] of Object.entries(snap.campaigns)) {
-        const prev = lastSeen[id];
-        if (i > 0) {
+    const lastSeen = {};
+    for (let i = 0; i < points.length; i++) {
+      const cur = points[i];
+      if (i > 0) {
+        const day = { date: points[i - 1].date, campaigns: {} };
+        for (const [id, c] of Object.entries(cur.campaigns)) {
+          const prev = lastSeen[id];
           const d = {};
-          for (const m of METRICS) d[m] = Math.max(0, (cur[m] || 0) - (prev ? prev[m] || 0 : 0));
+          for (const m of METRICS) d[m] = Math.max(0, (c[m] || 0) - (prev ? prev[m] || 0 : 0));
           day.campaigns[id] = d;
         }
-        lastSeen[id] = cur;
+        out.push(day);
       }
-      if (i > 0) out.push(day);
-    });
+      for (const [id, c] of Object.entries(cur.campaigns)) lastSeen[id] = c;
+    }
     return out;
   }
 
-  function init() {
-    const updated = latest.updated_at ? new Date(latest.updated_at) : null;
-    $("sync-status").textContent = updated
-      ? `Last synced ${updated.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })}${latest.demo ? " (demo data)" : ""}`
-      : "Not synced yet";
+  // ---------- One-time setup ----------
 
-    if (!latest.campaigns?.length) {
-      showNotice("No campaign data yet. Run the “Daily Smartlead sync” workflow from your repo's Actions tab, or run npm run demo to preview with sample data.");
-    } else if (deltas.length === 0) {
-      showNotice("Daily trends and the 7/30/90-day views start after the second daily sync. Until then you're seeing all-time totals.");
-    }
-
-    // Range buttons
+  function setup() {
     document.querySelectorAll(".range button").forEach((btn) => {
-      const r = btn.dataset.range;
-      if (r !== "all" && deltas.length === 0) btn.disabled = true;
       btn.addEventListener("click", () => {
-        state.range = r;
+        state.range = btn.dataset.range;
         document.querySelectorAll(".range button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
         render();
       });
     });
 
-    // Status filter
-    const statuses = [...new Set(latest.campaigns.map((c) => c.status))].sort();
-    $("status-filter").insertAdjacentHTML("beforeend", statuses.map((s) => `<option value="${esc(s)}">${esc(titleCase(s))}</option>`).join(""));
     $("status-filter").addEventListener("change", (e) => { state.status = e.target.value; render(); });
     $("search").addEventListener("input", (e) => { state.search = e.target.value.toLowerCase(); renderTable(currentRows()); });
 
-    // Sorting
     document.querySelectorAll("thead th").forEach((th) => {
       th.tabIndex = 0;
       const sort = () => {
@@ -93,37 +146,54 @@
       th.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
     });
 
+    $("refresh").addEventListener("click", () => load({ fresh: true }));
     $("export-csv").addEventListener("click", exportCsv);
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderChart());
 
-    render();
+    // Auto-refresh while the tab is open; refresh immediately when you come back to it.
+    const schedule = () => { clearInterval(timer); timer = setInterval(() => !document.hidden && load(), AUTO_REFRESH_MS); };
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && data?.updated_at && Date.now() - new Date(data.updated_at) > AUTO_REFRESH_MS) load();
+    });
+    schedule();
   }
 
-  function showNotice(text) {
-    $("notice").textContent = text;
-    $("notice").hidden = false;
+  function updateControls() {
+    const hasDeltas = deltas.length > 0;
+    document.querySelectorAll(".range button").forEach((btn) => {
+      btn.disabled = btn.dataset.range !== "all" && !hasDeltas;
+    });
+    if (!hasDeltas && state.range !== "all") {
+      state.range = "all";
+      document.querySelectorAll(".range button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.range === "all")));
+    }
+
+    const select = $("status-filter");
+    const statuses = [...new Set((data.campaigns || []).map((c) => c.status))].sort();
+    if (state.status && !statuses.includes(state.status)) state.status = "";
+    select.innerHTML = `<option value="">All statuses</option>` +
+      statuses.map((s) => `<option value="${esc(s)}"${s === state.status ? " selected" : ""}>${esc(titleCase(s))}</option>`).join("");
   }
 
-  function titleCase(s) {
-    return String(s || "").toLowerCase().replace(/(^|\s|_)\w/g, (m) => m.toUpperCase()).replace(/_/g, " ");
-  }
+  // ---------- Data shaping ----------
 
   function rangeDeltas() {
     if (state.range === "all") return deltas;
     const n = Number(state.range);
-    const last = deltas.at(-1)?.date || latest.date;
+    const last = deltas.at(-1)?.date;
+    if (!last) return [];
     const cutoff = new Date(`${last}T00:00:00Z`);
     cutoff.setUTCDate(cutoff.getUTCDate() - n + 1);
     const cut = cutoff.toISOString().slice(0, 10);
     return deltas.filter((d) => d.date >= cut);
   }
 
-  // Rows for the table/funnel, respecting range + status filter
   function currentRows() {
-    const byId = Object.fromEntries(latest.campaigns.map((c) => [String(c.id), c]));
+    const campaigns = data.campaigns || [];
+    const byId = Object.fromEntries(campaigns.map((c) => [String(c.id), c]));
     let rows;
     if (state.range === "all") {
-      rows = latest.campaigns.map((c) => ({ ...c }));
+      rows = campaigns.map((c) => ({ ...c }));
     } else {
       const sums = {};
       for (const day of rangeDeltas()) {
@@ -134,7 +204,10 @@
       }
       rows = Object.entries(sums)
         .filter(([, s]) => METRICS.some((m) => s[m] > 0))
-        .map(([id, s]) => ({ id, name: byId[id]?.name || `Campaign ${id}`, status: byId[id]?.status || "UNKNOWN", plain_text: byId[id]?.plain_text, ...s }));
+        .map(([id, s]) => ({
+          id, name: byId[id]?.name || `Campaign ${id}`, status: byId[id]?.status || "UNKNOWN",
+          plain_text: byId[id]?.plain_text, ...s,
+        }));
     }
     if (state.status) rows = rows.filter((r) => r.status === state.status);
     return rows.map((r) => ({
@@ -145,17 +218,19 @@
     }));
   }
 
+  function totals(rows) {
+    const t = Object.fromEntries(METRICS.map((m) => [m, 0]));
+    for (const r of rows) for (const m of METRICS) t[m] += r[m] || 0;
+    return t;
+  }
+
+  // ---------- Rendering ----------
+
   function render() {
     const rows = currentRows();
     renderFunnel(rows);
     renderChart();
     renderTable(rows);
-  }
-
-  function totals(rows) {
-    const t = Object.fromEntries(METRICS.map((m) => [m, 0]));
-    for (const r of rows) for (const m of METRICS) t[m] += r[m] || 0;
-    return t;
   }
 
   function renderFunnel(rows) {
@@ -177,14 +252,13 @@
       </div>`).join("");
     requestAnimationFrame(() => {
       document.querySelectorAll(".bar > i").forEach((el) => {
-        // keep tiny-but-nonzero values visible
         const w = Number(el.dataset.w);
         el.style.width = w > 0 ? `max(${(w * 100).toFixed(2)}%, 4px)` : "0";
       });
     });
 
     const active = rows.filter((r) => r.status === "ACTIVE").length;
-    const periodLabel = state.range === "all" ? "all time" : `last ${state.range} days`;
+    const periodLabel = state.range === "all" ? "all time" : `last ${state.range} days (incl. today)`;
     $("side-stats").innerHTML = `
       <div><dt>Bounced</dt><dd>${fmt.format(t.bounced)}<small>${fmtPct(pct(t.bounced, t.sent))}</small></dd></div>
       <div><dt>Unsubscribed</dt><dd>${fmt.format(t.unsubscribed)}<small>${fmtPct(pct(t.unsubscribed, base))}</small></dd></div>
@@ -201,7 +275,7 @@
       empty.hidden = false;
       empty.textContent = typeof Chart === "undefined"
         ? "The chart library didn't load. Check your connection and refresh."
-        : "Daily activity appears after the second daily sync.";
+        : "Daily activity appears after the first nightly snapshot (just after midnight IST).";
       $("trend-sub").textContent = "";
       return;
     }
@@ -209,7 +283,7 @@
     empty.hidden = true;
 
     const filterIds = state.status
-      ? new Set(latest.campaigns.filter((c) => c.status === state.status).map((c) => String(c.id)))
+      ? new Set((data.campaigns || []).filter((c) => c.status === state.status).map((c) => String(c.id)))
       : null;
     const series = { sent: [], unique_opened: [], replied: [] };
     for (const day of days) {
@@ -220,16 +294,23 @@
       }
       for (const k in series) series[k].push(s[k]);
     }
-    $("trend-sub").textContent = `${days[0].date} to ${days.at(-1).date}`;
+    const lastIsToday = data.live;
+    $("trend-sub").textContent = `${days[0].date} to ${days.at(-1).date}${lastIsToday ? " · today so far is live" : ""}`;
 
-    const labels = days.map((d) => new Date(`${d.date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" }));
+    const labels = days.map((d, i) => {
+      const l = new Date(`${d.date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+      return lastIsToday && i === days.length - 1 ? `${l} (today)` : l;
+    });
     const ink = cssVar("--muted");
     const rule = cssVar("--rule");
-    const ds = (label, data, color, axis) => ({
-      label, data, yAxisID: axis, borderColor: color, backgroundColor: color,
-      borderWidth: 2, pointRadius: days.length > (window.innerWidth < 600 ? 14 : 45) ? 0 : 2.5, pointHoverRadius: 5, tension: 0.25,
+    const narrow = window.innerWidth < 600;
+    const ds = (label, values, color, axis) => ({
+      label, data: values, yAxisID: axis, borderColor: color, backgroundColor: color,
+      borderWidth: 2, pointRadius: days.length > (narrow ? 14 : 45) ? 0 : 2.5, pointHoverRadius: 5, tension: 0.25,
+      segment: lastIsToday ? { borderDash: (ctx) => (ctx.p1DataIndex === days.length - 1 ? [4, 4] : undefined) } : undefined,
     });
 
+    Chart.defaults.font.family = cssVar("--font");
     const config = {
       type: "line",
       data: {
@@ -257,7 +338,6 @@
         },
       },
     };
-    Chart.defaults.font.family = cssVar("--font");
     if (chart) chart.destroy();
     chart = new Chart($("trend-chart"), config);
   }
@@ -311,12 +391,14 @@
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const csv = [cols.join(","), ...rows.map((r) => cols.map((c) => cell(r[c])).join(","))].join("\n");
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    a.download = `smartlead-${state.range === "all" ? "all-time" : `last-${state.range}-days`}-${latest.date || "export"}.csv`;
+    a.download = `smartlead-${state.range === "all" ? "all-time" : `last-${state.range}-days`}-${stamp}.csv`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
+  setup();
   load();
 })();
