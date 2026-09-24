@@ -1,3 +1,4 @@
+/* public/styles.css */
 :root {
   --bg: #eef1f4;
   --surface: #ffffff;
@@ -71,7 +72,16 @@ body {
   margin-bottom: 2rem;
 }
 h1 { margin: 0; font-size: 1.75rem; font-weight: 500; letter-spacing: -0.01em; }
-.sync { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.875rem; }
+.sync { margin: 0.25rem 0 0; color: var(--muted); font-size: 0.875rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.live-dot[data-state="live"] { background: var(--opened); box-shadow: 0 0 0 3px color-mix(in srgb, var(--opened) 25%, transparent); }
+.live-dot[data-state="loading"] { background: var(--replied); }
+.live-dot[data-state="error"] { background: var(--bounced); }
+.link-btn {
+  font: inherit; font-size: 0.875rem; color: var(--sent); background: none; border: 0;
+  padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
+}
+.link-btn:disabled { color: var(--muted); cursor: progress; text-decoration: none; }
 
 .range {
   display: inline-flex; padding: 3px; gap: 2px;
