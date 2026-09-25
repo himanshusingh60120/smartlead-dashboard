@@ -272,17 +272,20 @@
     const t = totals(rows);
     const base = t.unique_sent || t.sent || 0;
 
-    // Lead counts and campaign counts are current state, so they cover every campaign
-    // (respecting the status filter), not only the ones with activity in the period.
-    const all = (data.campaigns || []).filter((c) => !state.status || c.status === state.status);
-    const leadsTotal = all.reduce((a, c) => a + (c.leads_total || 0), 0);
-    const leadsWaiting = all.some((c) => c.leads_not_started != null)
-      ? all.reduce((a, c) => a + (c.leads_not_started || 0), 0) : null;
+    // Total leads = the same campaigns as the table below, so the numbers always add up.
+    const leadsTotal = rows.reduce((a, r) => a + (r.leads_total || 0), 0);
+    const leadsWaiting = rows.some((r) => r.leads_not_started != null)
+      ? rows.reduce((a, r) => a + (r.leads_not_started || 0), 0) : null;
+    // Leads in campaigns not shown (paused, or no activity in this period)
+    const shownIds = new Set(rows.map((r) => String(r.id)));
+    const hidden = (data.campaigns || []).filter((c) => !shownIds.has(String(c.id)) && (!state.status || c.status === state.status));
+    const leadsHidden = hidden.reduce((a, c) => a + (c.leads_total || 0), 0);
     const scale = leadsTotal || base; // bars are drawn relative to total leads
 
     const stages = [
-      { label: "Total leads", value: leadsTotal, color: "--leads",
-        note: leadsWaiting == null ? "uploaded to campaigns" : `${fmt.format(leadsWaiting)} yet to start`, width: leadsTotal > 0 ? 1 : 0 },
+      { label: `Total leads · ${rows.length} campaign${rows.length === 1 ? "" : "s"}`, value: leadsTotal, color: "--leads",
+        note: leadsWaiting == null ? "uploaded to campaigns" : `${fmt.format(leadsWaiting)} yet to start`, width: leadsTotal > 0 ? 1 : 0,
+        extra: leadsHidden ? `+ ${fmt.format(leadsHidden)} more in ${hidden.length} other campaign${hidden.length === 1 ? "" : "s"} (paused or no activity in this period)` : "" },
       { label: "Emails sent", value: t.sent, color: "--sent",
         note: `${fmt.format(t.unique_sent)} leads contacted${leadsTotal ? ` · ${fmtPct(pct(t.unique_sent, leadsTotal))} of leads` : ""}`, width: pct(t.unique_sent, scale) },
       { label: "Opened", value: t.unique_opened, color: "--opened", note: `${fmtPct(pct(t.unique_opened, base))} open rate`, width: pct(t.unique_opened, scale) },
@@ -295,6 +298,7 @@
         <div>
           <div class="stage-label"><strong>${s.label}</strong><span>${s.note}</span></div>
           <div class="bar"><i data-w="${Math.min(1, s.width || 0)}"></i></div>
+          ${s.extra ? `<p class="stage-extra">${s.extra}</p>` : ""}
         </div>
       </div>`).join("");
     requestAnimationFrame(() => {
