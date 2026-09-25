@@ -319,11 +319,22 @@
       <div><dt>Period</dt><dd style="font-size:1rem;font-weight:400">${periodLabel}${rows.length !== everyCampaign.length ? `<br><small style="margin:0">${rows.length} campaign${rows.length === 1 ? "" : "s"} with activity</small>` : ""}</dd></div>`;
   }
 
-  // Monday of the week containing `date` (YYYY-MM-DD)
-  function weekStart(date) {
-    const d = new Date(`${date}T00:00:00Z`);
-    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
-    return d.toISOString().slice(0, 10);
+  // Chart buckets: day, week of the month (1–7, 8–14, 15–21, 22–28, 29–end), or month
+  const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  const lastDayOfMonth = (y, m) => new Date(Date.UTC(y, m, 0)).getUTCDate(); // m is 1-based
+  function bucketOf(date, granularity) {
+    const [y, m, d] = date.split("-").map(Number);
+    const mon = MONTHS[m - 1];
+    if (granularity === "week") {
+      const wk = Math.ceil(d / 7);
+      const first = (wk - 1) * 7 + 1;
+      const last = wk === 5 ? lastDayOfMonth(y, m) : wk * 7;
+      return { key: `${y}-${String(m).padStart(2, "0")}-w${wk}`, label: `${mon} · Wk ${wk}`, range: `${mon} ${first}–${last}, ${y}` };
+    }
+    if (granularity === "month") {
+      return { key: `${y}-${String(m).padStart(2, "0")}`, label: `${mon} ${y}`, range: `${mon} 1–${lastDayOfMonth(y, m)}, ${y}` };
+    }
+    return { key: date, label: `${mon} ${d}`, range: `${mon} ${d}, ${y}` };
   }
 
   function renderChart() {
@@ -355,51 +366,40 @@
       }
       return s;
     });
-    const weekly = state.granularity === "week";
-    let buckets = perDay;
-    if (weekly) {
-      const map = new Map();
-      for (const d of perDay) {
-        const w = weekStart(d.date);
-        const b = map.get(w) || { date: w, sent: 0, unique_opened: 0, clicked: 0, replied: 0, days: 0 };
-        b.sent += d.sent; b.unique_opened += d.unique_opened; b.clicked += d.clicked; b.replied += d.replied; b.days++;
-        map.set(w, b);
-      }
-      buckets = [...map.values()];
+    const g = state.granularity;
+    const grouped = g === "week" || g === "month";
+    const map = new Map();
+    for (const d of perDay) {
+      const info = bucketOf(d.date, g);
+      const bk = map.get(info.key) || { ...info, sent: 0, unique_opened: 0, clicked: 0, replied: 0, days: 0 };
+      bk.sent += d.sent; bk.unique_opened += d.unique_opened; bk.clicked += d.clicked; bk.replied += d.replied; bk.days++;
+      map.set(info.key, bk);
     }
+    const buckets = [...map.values()];
 
     const todayLive = data.live;
-    const short = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" });
-    const labels = buckets.map((b, i) => {
-      const isLast = i === buckets.length - 1;
-      if (weekly) {
-        const end = new Date(`${b.date}T00:00:00Z`); end.setUTCDate(end.getUTCDate() + 6);
-        return `${short(b.date)}–${short(end.toISOString().slice(0, 10))}${isLast && todayLive ? " (this week)" : ""}`;
-      }
-      return `${short(b.date)}${isLast && todayLive ? " (today)" : ""}`;
-    });
+    const currentWord = { day: "today", week: "this week", month: "this month" }[g] || "today";
+    const labels = buckets.map((b, i) => `${b.label}${i === buckets.length - 1 && todayLive ? ` (${currentWord})` : ""}`);
     const sum = (k) => buckets.reduce((a, b) => a + b[k], 0);
     $("trend-sub").textContent =
       `${fmt.format(sum("sent"))} sent · ${fmt.format(sum("unique_opened"))} opened · ${fmt.format(sum("replied"))} replies` +
-      (todayLive ? (weekly ? " · this week so far is live" : " · today so far is live") : "");
+      (todayLive ? ` · ${currentWord} so far is live` : "");
 
     const ink = cssVar("--muted");
     const rule = cssVar("--rule");
     const narrow = window.innerWidth < 600;
     const last = buckets.length - 1;
-    const ds = (label, key, color, axis) => {
-      const base = { label, data: buckets.map((b) => b[key]), yAxisID: axis, borderColor: color, backgroundColor: color };
-      if (weekly) return { ...base, type: "bar", borderWidth: 0, borderRadius: 3, maxBarThickness: 36 };
-      return {
-        ...base, type: "line", borderWidth: 2, tension: 0.25, pointHoverRadius: 5,
-        pointRadius: buckets.length > (narrow ? 14 : 45) ? 0 : 3,
-        segment: todayLive ? { borderDash: (ctx) => (ctx.p1DataIndex === last ? [4, 4] : undefined) } : undefined,
-      };
-    };
+    // Line chart for every view; the last point is still in progress, so its segment is dashed
+    const ds = (label, key, color, axis) => ({
+      label, data: buckets.map((b) => b[key]), yAxisID: axis, borderColor: color, backgroundColor: color,
+      type: "line", borderWidth: 2, tension: 0.25, pointHoverRadius: 6,
+      pointRadius: buckets.length > (narrow ? 14 : 45) ? 0 : grouped ? 4 : 3,
+      segment: todayLive ? { borderDash: (ctx) => (ctx.p1DataIndex === last ? [4, 4] : undefined) } : undefined,
+    });
 
     Chart.defaults.font.family = cssVar("--font");
     const config = {
-      type: weekly ? "bar" : "line",
+      type: "line",
       data: {
         labels,
         datasets: [
@@ -414,21 +414,28 @@
         interaction: { mode: "index", intersect: false },
         animation: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? false : { duration: 400 },
         plugins: {
-          legend: { position: "top", align: "start", labels: { color: ink, boxWidth: 12, boxHeight: weekly ? 12 : 2 } },
+          legend: { position: "top", align: "start", labels: { color: ink, boxWidth: 12, boxHeight: 2 } },
           tooltip: {
             callbacks: {
-              title: (items) => labels[items[0].dataIndex],
+              title: (items) => {
+                const b = buckets[items[0].dataIndex];
+                return grouped ? `${b.label} (${b.range})` : b.range;
+              },
               label: (c) => ` ${c.dataset.label}: ${fmt.format(c.parsed.y)}`,
               afterBody: (items) => {
                 const b = buckets[items[0].dataIndex];
                 const rate = b.sent ? ` · open rate ${fmtPct(pct(b.unique_opened, b.sent))}` : "";
-                return weekly ? `${b.days} day${b.days === 1 ? "" : "s"} of data${rate}` : rate.replace(" · ", "");
+                return grouped ? `${b.days} day${b.days === 1 ? "" : "s"} of data${rate}` : rate.replace(" · ", "");
               },
             },
           },
         },
         scales: {
-          x: { ticks: { color: ink, maxRotation: 0, autoSkipPadding: 16 }, grid: { display: false }, border: { color: rule } },
+          x: {
+            // weeks and months: label every point (only skip when there are too many to fit)
+            ticks: { color: ink, maxRotation: 0, autoSkip: !grouped || buckets.length > (narrow ? 5 : 14), autoSkipPadding: 12, font: { size: grouped ? 11 : 12 } },
+            grid: { display: false }, border: { color: rule },
+          },
           y: { beginAtZero: true, ticks: { color: ink, precision: 0 }, grid: { color: rule }, border: { display: false },
                title: { display: true, text: "Sent / opened", color: ink } },
           y2: { position: "right", beginAtZero: true, ticks: { color: ink, precision: 0 }, grid: { display: false }, border: { display: false },
