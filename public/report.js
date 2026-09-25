@@ -20,6 +20,7 @@
   const longDate = (date) => new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 
   let report = null;
+  let lastSummary = []; // [label, value, note] rows for the CSV
   let requestId = 0;
 
   async function getJson(url) {
@@ -125,6 +126,18 @@
     const opened = t ? t.unique_opened : c?.opened;
     const clicked = t ? t.clicked : c?.clicked;
 
+    lastSummary = [
+      ["Emails sent", sent, "exact, from send timestamps"],
+      ["Leads contacted", leads, ""],
+      [t ? "Opened (unique)" : "Leads opened", opened, t ? `open rate ${pctOf(opened, t.unique_sent) || "–"}` : "from lead activity"],
+      [t ? "Clicks" : "Leads clicked", clicked, ""],
+      ["Replies", replies, `reply rate ${pctOf(replies, leads) || "–"}`],
+      ["Bounced", t ? t.bounced : null, t ? "" : "not available for this day"],
+      ["Unsubscribed", t ? t.unsubscribed : null, t ? "" : "not available for this day"],
+      ["Leads who opened", c?.opened, "listed below"],
+      ["Leads who clicked", c?.clicked, "listed below"],
+      ["Leads who replied", c?.replied, "listed below"],
+    ];
     $("summary").innerHTML =
       item("Emails sent", sent, leads != null ? `${fmt.format(leads)} leads` : "") +
       item(t ? "Opened" : "Leads opened", opened, pctOf(opened, t ? t.unique_sent : leads)) +
@@ -188,20 +201,56 @@
 
   function exportCsv() {
     if (!report) return;
-    const cols = ["type", "lead_email", "campaign_name", "seq", "subject", "sent_time", "opens", "clicks", "reply_time", "reply_text", "from_email"];
     const cell = (v) => {
-      const s = v == null ? "" : String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      const str = v == null ? "" : String(v);
+      return /[",\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
     };
-    const rows = [
-      ...report.replied.map((r) => ({ type: "replied", ...r })),
-      ...report.clicked.map((r) => ({ type: "clicked", ...r })),
-      ...report.opened.map((r) => ({ type: "opened", ...r })),
+    const line = (arr) => arr.map(cell).join(",");
+    const ist = (t) => (t ? new Date(t).toLocaleString("en-IN", { timeZone: TIME_ZONE, day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true }) : "");
+
+    // One row per lead + email, with every signal on it
+    const byKey = new Map();
+    const add = (r) => {
+      const key = `${r.lead_id}|${r.campaign_id}|${r.seq}|${r.sent_time}`;
+      const row = byKey.get(key) || { ...r };
+      if (r.reply_time) { row.reply_time = r.reply_time; row.reply_text = r.reply_text; }
+      byKey.set(key, row);
+    };
+    [...report.replied, ...report.clicked, ...report.opened].forEach(add);
+    const rows = [...byKey.values()].sort((a, b) =>
+      (b.reply_time ? 1 : 0) - (a.reply_time ? 1 : 0) || b.clicks - a.clicks || b.opens - a.opens);
+
+    const d = report.date;
+    const out = [
+      line(["Smartlead daily report"]),
+      line(["Date", longDate(d)]),
+      line(["Time window (IST)", `${ist(report.from)} to ${ist(report.to)}`]),
+      line(["Exported at (IST)", ist(new Date().toISOString())]),
+      "",
+      line(["Metric", "Value", "Note"]),
+      ...lastSummary.map(([label, value, note]) => line([label, value ?? "", note])),
+      "",
+      line([
+        "Engagement", "Lead email", "Lead status", "Campaign", "Campaign ID", "Sequence step", "Subject",
+        "Sent from", "Sent at (IST)", "Sent on this day", "Opened", "Opens", "Clicked", "Clicks", "Links clicked",
+        "Replied", "Replied at (IST)", "Reply text", "Email we sent",
+      ]),
+      ...rows.map((r) => line([
+        r.reply_time ? "Replied" : r.clicks > 0 ? "Clicked" : "Opened",
+        r.lead_email, r.lead_status, r.campaign_name, r.campaign_id, r.seq, r.subject,
+        r.from_email, ist(r.sent_time), r.sent_in_day ? "Yes" : "No",
+        r.opens > 0 ? "Yes" : "No", r.opens, r.clicks > 0 ? "Yes" : "No", r.clicks, (r.links || []).join(" | "),
+        r.reply_time ? "Yes" : "No", ist(r.reply_time), r.reply_text || "", r.body || "",
+      ])),
     ];
-    const csv = [cols.join(","), ...rows.map((r) => cols.map((c) => cell(r[c])).join(","))].join("\n");
+    download(`smartlead-daily-report-${d}.csv`, out.join("\r\n"));
+  }
+
+  function download(name, text) {
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    a.download = `smartlead-report-${report.date}.csv`;
+    // BOM so Excel opens it as UTF-8 (names, ₹, accents display correctly)
+    a.href = URL.createObjectURL(new Blob(["\ufeff" + text], { type: "text/csv;charset=utf-8" }));
+    a.download = name;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
