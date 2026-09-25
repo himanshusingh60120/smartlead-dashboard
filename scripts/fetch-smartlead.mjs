@@ -53,6 +53,7 @@ async function main() {
   } else {
     history.snapshots.push({
       date,
+      taken_at: new Date().toISOString(),
       campaigns: Object.fromEntries(campaigns.map((c) => [c.id, Object.fromEntries(METRICS.map((m) => [m, c[m]]))])),
     });
     history.snapshots.sort((a, b) => a.date.localeCompare(b.date));
