@@ -76,10 +76,14 @@ export default async function handler(req, res) {
     const clicked = [];
     const replied = [];
     let sentInDay = 0;
+    let repliesInDay = 0;
+    const leadsSent = new Set();
 
     for (const lead of leads) {
       const acts = [...(lead.activities || [])].sort((a, b) => new Date(a.sent_time) - new Date(b.sent_time));
-      sentInDay += acts.filter((a) => inDay(a.sent_time)).length;
+      const sentToday = acts.filter((a) => inDay(a.sent_time)).length;
+      sentInDay += sentToday;
+      if (sentToday) leadsSent.add(lead.lead_id);
 
       // Opens/clicks have no timestamp in Smartlead's API, so we look at emails sent that day,
       // emails replied to that day, and the latest email the lead had received by the end of the day.
@@ -113,6 +117,7 @@ export default async function handler(req, res) {
           reply_text: null,
         };
 
+        repliesInDay += dayReplies.length;
         if (dayReplies.length) {
           const r = dayReplies[dayReplies.length - 1];
           replied.push({
@@ -143,6 +148,8 @@ export default async function handler(req, res) {
       counts: {
         leads_with_activity: leads.length,
         sent_in_day: sentInDay,
+        leads_sent_in_day: leadsSent.size,
+        replies_in_day: repliesInDay,
         opened: new Set(opened.map((r) => r.lead_id)).size,
         clicked: new Set(clicked.map((r) => r.lead_id)).size,
         replied: new Set(replied.map((r) => r.lead_id)).size,
