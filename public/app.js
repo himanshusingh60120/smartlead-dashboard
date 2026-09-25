@@ -5,7 +5,7 @@
   const METRICS = ["sent", "unique_sent", "unique_opened", "clicked", "replied", "bounced", "unsubscribed"];
   const AUTO_REFRESH_MS = 5 * 60 * 1000;
 
-  const state = { range: "all", sortKey: "sent", sortDir: "desc", search: "", status: "" };
+  const state = { range: "all", granularity: "day", sortKey: "sent", sortDir: "desc", search: "", status: "" };
   let data = null;      // { updated_at, live, campaigns, error? }
   let snapshots = [];   // daily snapshots from history.json (totals at the start of each day)
   let deltas = [];      // [{ date, campaigns: { id: { metric: n } } }]
@@ -147,10 +147,10 @@
   // ---------- One-time setup ----------
 
   function setup() {
-    document.querySelectorAll(".range button").forEach((btn) => {
+    document.querySelectorAll(".range:not(.granularity) button").forEach((btn) => {
       btn.addEventListener("click", () => {
         state.range = btn.dataset.range;
-        document.querySelectorAll(".range button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+        document.querySelectorAll(".range:not(.granularity) button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
         render();
       });
     });
@@ -170,6 +170,14 @@
       th.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); sort(); } });
     });
 
+    document.querySelectorAll(".granularity button").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        state.granularity = btn.dataset.g;
+        document.querySelectorAll(".granularity button").forEach((b) => b.setAttribute("aria-pressed", String(b === btn)));
+        renderChart();
+      });
+    });
+
     $("refresh").addEventListener("click", () => load({ fresh: true }));
     $("export-csv").addEventListener("click", exportCsv);
     window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => renderChart());
@@ -184,12 +192,12 @@
 
   function updateControls() {
     const hasDeltas = deltas.length > 0;
-    document.querySelectorAll(".range button").forEach((btn) => {
+    document.querySelectorAll(".range:not(.granularity) button").forEach((btn) => {
       btn.disabled = btn.dataset.range !== "all" && !hasDeltas;
     });
     if (!hasDeltas && state.range !== "all") {
       state.range = "all";
-      document.querySelectorAll(".range button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.range === "all")));
+      document.querySelectorAll(".range:not(.granularity) button").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.range === "all")));
     }
 
     const select = $("status-filter");
@@ -263,11 +271,23 @@
   function renderFunnel(rows) {
     const t = totals(rows);
     const base = t.unique_sent || t.sent || 0;
+
+    // Lead counts and campaign counts are current state, so they cover every campaign
+    // (respecting the status filter), not only the ones with activity in the period.
+    const all = (data.campaigns || []).filter((c) => !state.status || c.status === state.status);
+    const leadsTotal = all.reduce((a, c) => a + (c.leads_total || 0), 0);
+    const leadsWaiting = all.some((c) => c.leads_not_started != null)
+      ? all.reduce((a, c) => a + (c.leads_not_started || 0), 0) : null;
+    const scale = leadsTotal || base; // bars are drawn relative to total leads
+
     const stages = [
-      { label: "Emails sent", value: t.sent, color: "--sent", note: `${fmt.format(t.unique_sent)} unique leads`, width: t.sent > 0 ? 1 : 0 },
-      { label: "Opened", value: t.unique_opened, color: "--opened", note: `${fmtPct(pct(t.unique_opened, base))} open rate`, width: pct(t.unique_opened, base) },
-      { label: "Clicked", value: t.clicked, color: "--clicked", note: `${fmtPct(pct(t.clicked, base))} of leads`, width: pct(t.clicked, base) },
-      { label: "Replied", value: t.replied, color: "--replied", note: `${fmtPct(pct(t.replied, base))} reply rate`, width: pct(t.replied, base) },
+      { label: "Total leads", value: leadsTotal, color: "--leads",
+        note: leadsWaiting == null ? "uploaded to campaigns" : `${fmt.format(leadsWaiting)} yet to start`, width: leadsTotal > 0 ? 1 : 0 },
+      { label: "Emails sent", value: t.sent, color: "--sent",
+        note: `${fmt.format(t.unique_sent)} leads contacted${leadsTotal ? ` · ${fmtPct(pct(t.unique_sent, leadsTotal))} of leads` : ""}`, width: pct(t.unique_sent, scale) },
+      { label: "Opened", value: t.unique_opened, color: "--opened", note: `${fmtPct(pct(t.unique_opened, base))} open rate`, width: pct(t.unique_opened, scale) },
+      { label: "Clicked", value: t.clicked, color: "--clicked", note: `${fmtPct(pct(t.clicked, base))} click rate`, width: pct(t.clicked, scale) },
+      { label: "Replied", value: t.replied, color: "--replied", note: `${fmtPct(pct(t.replied, base))} reply rate`, width: pct(t.replied, scale) },
     ];
     $("funnel").innerHTML = stages.map((s) => `
       <div class="stage" style="--c: var(${s.color})">
@@ -284,17 +304,22 @@
       });
     });
 
-    const active = rows.filter((r) => r.status === "ACTIVE").length;
-    const leadsTotal = rows.reduce((a, r) => a + (r.leads_total || 0), 0);
-    const leadsWaiting = rows.some((r) => r.leads_not_started != null)
-      ? rows.reduce((a, r) => a + (r.leads_not_started || 0), 0) : null;
+    const everyCampaign = data.campaigns || [];
+    const active = everyCampaign.filter((c) => c.status === "ACTIVE").length;
+    const paused = everyCampaign.filter((c) => c.status === "PAUSED").length;
     const periodLabel = state.range === "all" ? "all time" : `last ${state.range} days (incl. today)`;
     $("side-stats").innerHTML = `
+      <div class="highlight"><dt>Active campaigns</dt><dd>${active}<small>of ${everyCampaign.length} total${paused ? ` · ${paused} paused` : ""}</small></dd></div>
       <div><dt>Bounced</dt><dd>${fmt.format(t.bounced)}<small>${fmtPct(pct(t.bounced, t.sent))}</small></dd></div>
       <div><dt>Unsubscribed</dt><dd>${fmt.format(t.unsubscribed)}<small>${fmtPct(pct(t.unsubscribed, base))}</small></dd></div>
-      <div><dt>Total leads</dt><dd>${fmt.format(leadsTotal)}<small>${leadsWaiting == null ? "" : `${fmt.format(leadsWaiting)} yet to start`}</small></dd></div>
-      <div><dt>Campaigns shown</dt><dd>${rows.length}<small>${active} active</small></dd></div>
-      <div><dt>Period</dt><dd style="font-size:1rem;font-weight:400">${periodLabel}</dd></div>`;
+      <div><dt>Period</dt><dd style="font-size:1rem;font-weight:400">${periodLabel}${rows.length !== everyCampaign.length ? `<br><small style="margin:0">${rows.length} campaign${rows.length === 1 ? "" : "s"} with activity</small>` : ""}</dd></div>`;
+  }
+
+  // Monday of the week containing `date` (YYYY-MM-DD)
+  function weekStart(date) {
+    const d = new Date(`${date}T00:00:00Z`);
+    d.setUTCDate(d.getUTCDate() - ((d.getUTCDay() + 6) % 7));
+    return d.toISOString().slice(0, 10);
   }
 
   function renderChart() {
@@ -306,7 +331,7 @@
       empty.hidden = false;
       empty.textContent = typeof Chart === "undefined"
         ? "The chart library didn't load. Check your connection and refresh."
-        : "Daily activity appears after the first nightly snapshot (just after midnight IST).";
+        : "Activity appears after the first nightly snapshot (just after midnight IST).";
       $("trend-sub").textContent = "";
       return;
     }
@@ -316,40 +341,68 @@
     const filterIds = state.status
       ? new Set((data.campaigns || []).filter((c) => c.status === state.status).map((c) => String(c.id)))
       : null;
-    const series = { sent: [], unique_opened: [], replied: [] };
-    for (const day of days) {
-      const s = { sent: 0, unique_opened: 0, replied: 0 };
+
+    // Sum each day, then group into weeks if asked
+    const perDay = days.map((day) => {
+      const s = { date: day.date, sent: 0, unique_opened: 0, clicked: 0, replied: 0 };
       for (const [id, d] of Object.entries(day.campaigns)) {
         if (filterIds && !filterIds.has(id)) continue;
-        s.sent += d.sent; s.unique_opened += d.unique_opened; s.replied += d.replied;
+        s.sent += d.sent; s.unique_opened += d.unique_opened; s.clicked += d.clicked; s.replied += d.replied;
       }
-      for (const k in series) series[k].push(s[k]);
-    }
-    const lastIsToday = data.live;
-    $("trend-sub").textContent = `${days[0].date} to ${days.at(-1).date}${lastIsToday ? " · today so far is live" : ""}`;
-
-    const labels = days.map((d, i) => {
-      const l = new Date(`${d.date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" });
-      return lastIsToday && i === days.length - 1 ? `${l} (today)` : l;
+      return s;
     });
+    const weekly = state.granularity === "week";
+    let buckets = perDay;
+    if (weekly) {
+      const map = new Map();
+      for (const d of perDay) {
+        const w = weekStart(d.date);
+        const b = map.get(w) || { date: w, sent: 0, unique_opened: 0, clicked: 0, replied: 0, days: 0 };
+        b.sent += d.sent; b.unique_opened += d.unique_opened; b.clicked += d.clicked; b.replied += d.replied; b.days++;
+        map.set(w, b);
+      }
+      buckets = [...map.values()];
+    }
+
+    const todayLive = data.live;
+    const short = (iso) => new Date(`${iso}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+    const labels = buckets.map((b, i) => {
+      const isLast = i === buckets.length - 1;
+      if (weekly) {
+        const end = new Date(`${b.date}T00:00:00Z`); end.setUTCDate(end.getUTCDate() + 6);
+        return `${short(b.date)}–${short(end.toISOString().slice(0, 10))}${isLast && todayLive ? " (this week)" : ""}`;
+      }
+      return `${short(b.date)}${isLast && todayLive ? " (today)" : ""}`;
+    });
+    const sum = (k) => buckets.reduce((a, b) => a + b[k], 0);
+    $("trend-sub").textContent =
+      `${fmt.format(sum("sent"))} sent · ${fmt.format(sum("unique_opened"))} opened · ${fmt.format(sum("replied"))} replies` +
+      (todayLive ? (weekly ? " · this week so far is live" : " · today so far is live") : "");
+
     const ink = cssVar("--muted");
     const rule = cssVar("--rule");
     const narrow = window.innerWidth < 600;
-    const ds = (label, values, color, axis) => ({
-      label, data: values, yAxisID: axis, borderColor: color, backgroundColor: color,
-      borderWidth: 2, pointRadius: days.length > (narrow ? 14 : 45) ? 0 : 2.5, pointHoverRadius: 5, tension: 0.25,
-      segment: lastIsToday ? { borderDash: (ctx) => (ctx.p1DataIndex === days.length - 1 ? [4, 4] : undefined) } : undefined,
-    });
+    const last = buckets.length - 1;
+    const ds = (label, key, color, axis) => {
+      const base = { label, data: buckets.map((b) => b[key]), yAxisID: axis, borderColor: color, backgroundColor: color };
+      if (weekly) return { ...base, type: "bar", borderWidth: 0, borderRadius: 3, maxBarThickness: 36 };
+      return {
+        ...base, type: "line", borderWidth: 2, tension: 0.25, pointHoverRadius: 5,
+        pointRadius: buckets.length > (narrow ? 14 : 45) ? 0 : 3,
+        segment: todayLive ? { borderDash: (ctx) => (ctx.p1DataIndex === last ? [4, 4] : undefined) } : undefined,
+      };
+    };
 
     Chart.defaults.font.family = cssVar("--font");
     const config = {
-      type: "line",
+      type: weekly ? "bar" : "line",
       data: {
         labels,
         datasets: [
-          ds("Sent", series.sent, cssVar("--sent"), "y"),
-          ds("Opened (unique)", series.unique_opened, cssVar("--opened"), "y"),
-          ds("Replies", series.replied, cssVar("--replied"), "y2"),
+          ds("Sent", "sent", cssVar("--sent"), "y"),
+          ds("Opened (unique)", "unique_opened", cssVar("--opened"), "y"),
+          ds("Clicks", "clicked", cssVar("--clicked"), "y2"),
+          ds("Replies", "replied", cssVar("--replied"), "y2"),
         ],
       },
       options: {
@@ -357,15 +410,25 @@
         interaction: { mode: "index", intersect: false },
         animation: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? false : { duration: 400 },
         plugins: {
-          legend: { position: "top", align: "start", labels: { color: ink, boxWidth: 12, boxHeight: 2 } },
-          tooltip: { callbacks: { label: (c) => ` ${c.dataset.label}: ${fmt.format(c.parsed.y)}` } },
+          legend: { position: "top", align: "start", labels: { color: ink, boxWidth: 12, boxHeight: weekly ? 12 : 2 } },
+          tooltip: {
+            callbacks: {
+              title: (items) => labels[items[0].dataIndex],
+              label: (c) => ` ${c.dataset.label}: ${fmt.format(c.parsed.y)}`,
+              afterBody: (items) => {
+                const b = buckets[items[0].dataIndex];
+                const rate = b.sent ? ` · open rate ${fmtPct(pct(b.unique_opened, b.sent))}` : "";
+                return weekly ? `${b.days} day${b.days === 1 ? "" : "s"} of data${rate}` : rate.replace(" · ", "");
+              },
+            },
+          },
         },
         scales: {
           x: { ticks: { color: ink, maxRotation: 0, autoSkipPadding: 16 }, grid: { display: false }, border: { color: rule } },
           y: { beginAtZero: true, ticks: { color: ink, precision: 0 }, grid: { color: rule }, border: { display: false },
                title: { display: true, text: "Sent / opened", color: ink } },
           y2: { position: "right", beginAtZero: true, ticks: { color: ink, precision: 0 }, grid: { display: false }, border: { display: false },
-                title: { display: true, text: "Replies", color: ink } },
+                title: { display: true, text: "Clicks / replies", color: ink } },
         },
       },
     };
@@ -416,18 +479,75 @@
   }
 
   function exportCsv() {
-    const rows = currentRows().filter((r) => !state.search || r.name.toLowerCase().includes(state.search));
-    const cols = ["name", "status", "leads_total", "leads_not_started", "leads_in_progress", "leads_completed", "sent", "unique_sent", "unique_opened", "open_rate", "clicked", "replied", "reply_rate", "bounced", "bounce_rate", "unsubscribed"];
+    const byId = Object.fromEntries((data.campaigns || []).map((c) => [String(c.id), c]));
+    const rows = currentRows()
+      .filter((r) => !state.search || r.name.toLowerCase().includes(state.search))
+      .map((r) => ({ ...byId[String(r.id)], ...r })); // add campaign details (created, lead stats) in period views
+    const allTime = state.range === "all";
+    const ist = (t) => (t ? new Date(t).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true }) : "");
+    const p = (v) => (v == null ? "" : `${(v * 100).toFixed(2)}%`);
     const cell = (v) => {
-      if (v == null) return "";
-      const s = typeof v === "number" && !Number.isInteger(v) ? v.toFixed(4) : String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+      const str = v == null ? "" : String(v);
+      return /[",\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
     };
-    const csv = [cols.join(","), ...rows.map((r) => cols.map((c) => cell(r[c])).join(","))].join("\n");
-    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
+    const line = (arr) => arr.map(cell).join(",");
+
+    const cols = [
+      ["Campaign", (r) => r.name],
+      ["Campaign ID", (r) => r.id],
+      ["Status", (r) => titleCase(r.status)],
+      ["Created (IST)", (r) => ist(r.created_at)],
+      ["Total leads", (r) => r.leads_total],
+      ["Yet to start", (r) => r.leads_not_started],
+      ["In progress", (r) => r.leads_in_progress],
+      ["Completed", (r) => r.leads_completed],
+      ["Blocked", (r) => r.leads_blocked],
+      ["Emails sent", (r) => r.sent],
+      ["Leads contacted", (r) => r.unique_sent],
+      ["% of leads contacted", (r) => p(pct(r.unique_sent, r.leads_total))],
+      ["Opens (total)", (r) => (allTime ? r.opened : "")],
+      ["Unique opens", (r) => (r.plain_text ? "" : r.unique_opened)],
+      ["Open rate", (r) => p(r.open_rate)],
+      ["Clicks", (r) => r.clicked],
+      ["Unique clicks", (r) => (allTime ? r.unique_clicked : "")],
+      ["Click rate", (r) => p(pct(r.clicked, r.unique_sent))],
+      ["Replies", (r) => r.replied],
+      ["Reply rate", (r) => p(r.reply_rate)],
+      ["Interested leads", (r) => r.leads_interested],
+      ["Bounced", (r) => r.bounced],
+      ["Bounce rate", (r) => p(r.bounce_rate)],
+      ["Unsubscribed", (r) => r.unsubscribed],
+      ["Unsubscribe rate", (r) => p(pct(r.unsubscribed, r.unique_sent))],
+      ["Plain text (no open tracking)", (r) => (r.plain_text ? "Yes" : "No")],
+    ];
+
+    // Totals row
+    const sumKeys = ["leads_total", "leads_not_started", "leads_in_progress", "leads_completed", "leads_blocked", "sent", "unique_sent",
+      "opened", "unique_opened", "clicked", "unique_clicked", "replied", "leads_interested", "bounced", "unsubscribed"];
+    const T = Object.fromEntries(sumKeys.map((k) => [k, rows.reduce((a, r) => a + (Number(r[k]) || 0), 0)]));
+    Object.assign(T, {
+      name: "TOTAL", id: "", status: "", created_at: null,
+      open_rate: pct(T.unique_opened, T.unique_sent), reply_rate: pct(T.replied, T.unique_sent), bounce_rate: pct(T.bounced, T.sent),
+    });
+
+    const periodText = allTime ? "All time" : `Last ${state.range} days including today (IST)`;
+    const out = [
+      line(["Smartlead campaign report"]),
+      line(["Period", periodText]),
+      line(["Status filter", state.status ? titleCase(state.status) : "All statuses"]),
+      line(["Data as of (IST)", ist(data.updated_at)]),
+      line(["Exported at (IST)", ist(new Date().toISOString())]),
+      line(["Campaigns in file", rows.length]),
+      "",
+      line(cols.map(([h]) => h)),
+      ...rows.map((r) => line(cols.map(([, f]) => f(r)))),
+      line(cols.map(([h, f]) => (h === "Plain text (no open tracking)" ? "" : f(T)))),
+    ];
+
+    const stamp = new Date().toISOString().slice(0, 10);
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
-    a.download = `smartlead-${state.range === "all" ? "all-time" : `last-${state.range}-days`}-${stamp}.csv`;
+    a.href = URL.createObjectURL(new Blob(["\ufeff" + out.join("\r\n")], { type: "text/csv;charset=utf-8" }));
+    a.download = `smartlead-campaigns-${allTime ? "all-time" : `last-${state.range}-days`}-${stamp}.csv`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
