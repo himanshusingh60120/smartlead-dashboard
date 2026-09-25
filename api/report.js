@@ -24,7 +24,9 @@ export default async function handler(req, res) {
   }
 
   try {
+    const t0 = Date.now();
     const chunk = await fetchReportChunk(apiKey, date, { offset, limit, timeoutMs: 50000 });
+    chunk.smartlead_ms = Date.now() - t0; // lets the page tune its batch size
     res.status(200).json(chunk);
   } catch (err) {
     if (err.code === "RATE_LIMIT") return res.status(429).json({ code: "RATE_LIMIT", error: err.message });
