@@ -59,12 +59,14 @@ export default async function handler(req, res) {
     return;
   }
 
+  // Exactly 24 hours: midnight to the next midnight, India time.
+  // (Smartlead rejects ranges shorter than one full day.)
   const from = new Date(`${date}T00:00:00.000${TZ_OFFSET}`);
-  const to = new Date(`${date}T23:59:59.999${TZ_OFFSET}`);
+  const to = new Date(from.getTime() + 24 * 60 * 60 * 1000);
   const inDay = (t) => {
     if (!t) return false;
     const d = new Date(t);
-    return d >= from && d <= to;
+    return d >= from && d < to;
   };
 
   try {
@@ -81,7 +83,7 @@ export default async function handler(req, res) {
 
       // Opens/clicks have no timestamp in Smartlead's API, so we look at emails sent that day,
       // emails replied to that day, and the latest email the lead had received by the end of the day.
-      const latest = [...acts].reverse().find((a) => a.sent_time && new Date(a.sent_time) <= to);
+      const latest = [...acts].reverse().find((a) => a.sent_time && new Date(a.sent_time) < to);
 
       for (const a of acts) {
         const threadReplies = Array.isArray(a.thread_replies) ? a.thread_replies : [];
