@@ -84,8 +84,9 @@
   // If Smartlead is slow the batch size shrinks; if its 10-per-minute limit is hit, we wait and continue.
 
   async function fetchLiveReport(date, isCurrent, onProgress) {
+    const TARGET_MS = 10000; // aim for ~10s per Smartlead request
     let offset = 0;
-    let limit = 200;
+    let limit = 100;
     let failures = 0;
     let partial = false;
     const report = {
@@ -102,7 +103,7 @@
       } catch (err) {
         if (err.status === 429) {
           for (let s = 60; s > 0 && isCurrent(); s--) {
-            onProgress(report, `Smartlead's limit is 10 requests a minute. Continuing in ${s}s…`);
+            onProgress(report, `Smartlead allows 10 requests a minute; continuing in ${s}s`);
             await sleep(1000);
           }
           continue;
@@ -111,8 +112,8 @@
           failures++;
           limit = Math.max(25, Math.floor(limit / 2)); // smaller batch = faster answer
           if (failures <= 4) {
-            onProgress(report, `Smartlead is slow, retrying with smaller batches (attempt ${failures + 1})…`);
-            await sleep(2000 * failures);
+            onProgress(report, `Smartlead is slow, retrying with smaller batches`);
+            await sleep(1500 * failures);
             continue;
           }
         }
@@ -129,13 +130,37 @@
       report.opened.push(...chunk.opened);
       offset += chunk.received;
       finalize(report);
-      onProgress(report, `Fetching from Smartlead… ${fmt.format(offset)} leads so far`);
+      onProgress(report, `${fmt.format(offset)} leads loaded`);
       if (!chunk.hasMore || chunk.received === 0) break;
+
+      // Tune the next batch so each request takes ~10s
+      if (chunk.smartlead_ms > 0) {
+        limit = Math.round(Math.min(500, Math.max(25, limit * (TARGET_MS / chunk.smartlead_ms), limit / 2)));
+        limit = Math.min(limit, 500);
+      }
     }
 
     report.truncated = partial;
     report.generated_at = new Date().toISOString();
     return finalize(report);
+  }
+
+  // ---------- Keep the last result per day in this browser, for instant display ----------
+  const CACHE_PREFIX = "sl-report:";
+  function readCache(date) {
+    try { return JSON.parse(localStorage.getItem(CACHE_PREFIX + date) || "null"); } catch { return null; }
+  }
+  function writeCache(rep) {
+    try {
+      localStorage.setItem(CACHE_PREFIX + rep.date, JSON.stringify(rep));
+    } catch {
+      // Storage full: drop older days and try once more
+      try {
+        Object.keys(localStorage).filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_PREFIX + rep.date)
+          .forEach((k) => localStorage.removeItem(k));
+        localStorage.setItem(CACHE_PREFIX + rep.date, JSON.stringify(rep));
+      } catch { /* too large to keep; that's fine */ }
+    }
   }
 
   function finalize(report) {
@@ -152,47 +177,81 @@
   async function load(date) {
     const id = ++requestId;
     const isCurrent = () => id === requestId;
+    const started = Date.now();
     $("day").value = date;
     $("next-day").disabled = date >= today();
     history.replaceState(null, "", `?date=${date}`);
     $("report-title").textContent = date === today() ? "Today so far" : date === addDays(today(), -1) ? "Yesterday" : "Daily report";
-    setStatus("loading", `Fetching ${longDate(date)} from Smartlead…`);
     $("notice").hidden = true;
     $("refresh").disabled = true;
-    for (const k of ["replied", "clicked", "opened"]) { $(`${k}-list`).innerHTML = `<p class="empty">Loading…</p>`; $(`${k}-count`).textContent = ""; }
 
     const sumP = dayTotals(date).catch(() => null);
     let sum = null;
-    sumP.then((v) => { sum = v; });
+    sumP.then((v) => { sum = v; if (isCurrent() && shown) draw(shown); });
 
+    let shown = null;
     const draw = (rep) => {
+      shown = rep;
       renderSummary(sum, rep, date);
       renderList("replied", rep.replied);
       renderList("clicked", rep.clicked);
       renderList("opened", rep.opened);
     };
 
+    // Show the last result for this day straight away, if we have one
+    const cached = readCache(date);
+    const cachedAt = cached ? new Date(cached.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" }) : null;
+    if (cached) {
+      report = cached;
+      draw(cached);
+    } else {
+      renderSummary(null, null, date, { loading: true });
+      for (const k of ["replied", "clicked", "opened"]) { $(`${k}-list`).innerHTML = `<p class="empty">Loading from Smartlead…</p>`; $(`${k}-count`).textContent = ""; }
+    }
+
+    // Status line with a running timer
+    let progressMsg = "";
+    const tick = () => {
+      if (!isCurrent()) return clearInterval(timer);
+      const secs = Math.round((Date.now() - started) / 1000);
+      const lead = cached ? `Showing ${cachedAt} results · updating from Smartlead` : "Fetching from Smartlead";
+      setStatus("loading", `${lead}${progressMsg ? ` · ${progressMsg}` : ""} · ${secs}s`);
+    };
+    const timer = setInterval(tick, 1000);
+    tick();
+
     try {
       const rep = await fetchLiveReport(date, isCurrent, (partialRep, msg) => {
         if (!isCurrent()) return;
-        setStatus("loading", msg);
-        if (partialRep.counts.leads_with_activity) draw(partialRep);
+        progressMsg = msg;
+        tick();
+        // Without a cached copy, show results as they arrive
+        if (!cached && partialRep.counts.leads_with_activity) draw(partialRep);
       });
       if (!isCurrent()) return;
       sum = await sumP;
       report = rep;
       draw(rep);
+      if (!rep.truncated) writeCache(rep);
       const at = new Date(rep.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" });
-      setStatus("live", `${longDate(date)} · live from Smartlead, ${at} IST`);
+      const secs = Math.round((Date.now() - started) / 1000);
+      setStatus("live", `${longDate(date)} · live from Smartlead at ${at} IST (took ${secs}s)`);
       if (rep.truncated) showNotice("Smartlead stopped responding part-way, so the lists may be incomplete.", { retry: true });
     } catch (err) {
       if (!isCurrent()) return;
-      report = null;
-      renderSummary(await sumP, null, date);
-      setStatus("error", longDate(date));
-      showNotice(`Couldn't load the lead lists: ${err.status === 504 || err.status === 502 ? "Smartlead isn't responding right now." : err.message}`, { retry: true });
-      for (const k of ["replied", "clicked", "opened"]) $(`${k}-list`).innerHTML = `<p class="empty">Not available.</p>`;
+      const why = err.status === 504 || err.status === 502 ? "Smartlead isn't responding right now." : err.message;
+      if (cached) {
+        setStatus("error", `${longDate(date)} · showing results from ${cachedAt}`);
+        showNotice(`Couldn't update from Smartlead: ${why}`, { retry: true });
+      } else {
+        report = null;
+        renderSummary(await sumP, null, date);
+        setStatus("error", longDate(date));
+        showNotice(`Couldn't load the lead lists: ${why}`, { retry: true });
+        for (const k of ["replied", "clicked", "opened"]) $(`${k}-list`).innerHTML = `<p class="empty">Not available.</p>`;
+      }
     } finally {
+      clearInterval(timer);
       if (isCurrent()) $("refresh").disabled = false;
     }
   }
@@ -214,7 +273,13 @@
 
   // ---------- Rendering ----------
 
-  function renderSummary(sum, rep, date) {
+  function renderSummary(sum, rep, date, { loading = false } = {}) {
+    if (loading) {
+      $("summary").innerHTML = ["Emails sent", "Leads opened", "Leads clicked", "Replies", "Bounced", "Unsubscribed"]
+        .map((l) => `<div><dt>${l}</dt><dd class="pending">…</dd></div>`).join("");
+      $("summary-note").textContent = "Counted from 12:00 AM to 12:00 AM India time.";
+      return;
+    }
     const t = sum?.totals;
     const c = rep?.counts;
     const pctOf = (n, d) => (n != null && d > 0 ? `${((n / d) * 100).toFixed(1)}%` : "");
