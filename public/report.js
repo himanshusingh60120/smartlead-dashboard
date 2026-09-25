@@ -35,38 +35,39 @@
   }
 
   // ---------- Day totals from daily snapshots ----------
+  // Used only for numbers Smartlead doesn't timestamp (opens, clicks, bounces, unsubscribes).
+  // A day is only counted when it starts and ends on a snapshot taken around midnight IST.
+
+  const hourIST = (t) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: TIME_ZONE, hour: "2-digit", hourCycle: "h23" }).format(new Date(t)));
 
   async function dayTotals(date) {
     const hist = await getJson(`/data/history.json?t=${Date.now()}`).catch(() => ({ snapshots: [] }));
-    const snaps = Object.fromEntries((hist.snapshots || []).map((s) => [s.date, s]));
+    const list = [...(hist.snapshots || [])].sort((a, b) => a.date.localeCompare(b.date));
+    const snaps = Object.fromEntries(list.map((s) => [s.date, s]));
+    // Older snapshots have no taken_at: the very first one was a manual daytime run, the rest ran at midnight.
+    const atMidnight = (snap) => Boolean(snap) && (snap.taken_at ? hourIST(snap.taken_at) < 4 : snap !== list[0]);
+
     const start = snaps[date];
+    if (!atMidnight(start)) return null;
+
     let end = snaps[addDays(date, 1)];
-    let meta = [];
-
-    if (!end && addDays(date, 1) >= today()) {
-      // Today, or yesterday before tonight's snapshot: use live numbers as the end of the day.
+    const isToday = date === today();
+    if (end && !atMidnight(end)) return null;
+    if (!end) {
+      if (addDays(date, 1) < today()) return null; // a day is missing from history
+      // Today, or yesterday before tonight's snapshot has run: use live numbers.
       const live = await getJson("/api/stats").catch(() => null);
-      if (live) {
-        end = { campaigns: Object.fromEntries(live.campaigns.map((c) => [String(c.id), c])) };
-        meta = live.campaigns;
-      }
+      if (!live) return null;
+      end = { campaigns: Object.fromEntries(live.campaigns.map((c) => [String(c.id), c])) };
+      if (!isToday) return null; // yesterday without a midnight snapshot would include today's activity
     }
-    if (!end) return null;
-    if (!meta.length) meta = (await getJson(`/data/latest.json?t=${Date.now()}`).catch(() => ({ campaigns: [] }))).campaigns || [];
 
-    const created = Object.fromEntries(meta.map((c) => [String(c.id), c.created_at ? istDate(new Date(c.created_at)) : null]));
     const totals = Object.fromEntries(METRICS.map((m) => [m, 0]));
-    let skipped = 0;
     for (const [id, c] of Object.entries(end.campaigns)) {
-      let base = start?.campaigns?.[id];
-      if (!base) {
-        const cd = created[id];
-        if (cd && cd < date) { skipped++; continue; } // existed before our history; can't split by day
-        base = null; // new that day
-      }
+      const base = start.campaigns[id]; // missing = campaign created during the day
       for (const m of METRICS) totals[m] += Math.max(0, (c[m] || 0) - (base ? base[m] || 0 : 0));
     }
-    return { totals, skipped, isToday: date === today() };
+    return { totals, isToday };
   }
 
   // ---------- Loading ----------
@@ -110,31 +111,31 @@
 
   function renderSummary(sum, rep, date) {
     const t = sum?.totals;
-    const pctOf = (n, d) => (d > 0 ? `${((n / d) * 100).toFixed(1)}%` : "");
+    const c = rep?.counts;
+    const pctOf = (n, d) => (n != null && d > 0 ? `${((n / d) * 100).toFixed(1)}%` : "");
     const item = (label, value, sub = "") =>
       `<div><dt>${label}</dt><dd>${value == null ? "–" : fmt.format(value)}${sub ? `<small>${sub}</small>` : ""}</dd></div>`;
 
-    if (t) {
-      $("summary").innerHTML =
-        item("Emails sent", t.sent, `${fmt.format(t.unique_sent)} leads`) +
-        item("Opened", t.unique_opened, pctOf(t.unique_opened, t.unique_sent)) +
-        item("Clicked", t.clicked) +
-        item("Replied", t.replied, pctOf(t.replied, t.unique_sent)) +
-        item("Bounced", t.bounced, pctOf(t.bounced, t.sent)) +
-        item("Unsubscribed", t.unsubscribed);
-      const notes = [];
-      if (sum.isToday) notes.push("Today is still in progress; totals are live.");
-      if (sum.skipped) notes.push(`${sum.skipped} campaign${sum.skipped > 1 ? "s" : ""} started before your history began and aren't in these totals.`);
-      $("summary-note").textContent = notes.join(" ");
-    } else {
-      // No snapshots for this day: fall back to what the activity feed can count exactly.
-      $("summary").innerHTML =
-        item("Emails sent", rep?.counts?.sent_in_day) +
-        item("Leads opened", rep?.counts?.opened) +
-        item("Leads clicked", rep?.counts?.clicked) +
-        item("Leads replied", rep?.counts?.replied);
-      $("summary-note").textContent = `Full totals aren't available for ${longDate(date)} because it's before your daily history began. These counts come from lead activity.`;
-    }
+    // Exact, from Smartlead's timestamps within the IST day
+    const sent = c?.sent_in_day;
+    const leads = c?.leads_sent_in_day;
+    const replies = c?.replies_in_day ?? c?.replied;
+
+    // Opens/clicks: midnight-to-midnight snapshots when available, otherwise leads in the lists below
+    const opened = t ? t.unique_opened : c?.opened;
+    const clicked = t ? t.clicked : c?.clicked;
+
+    $("summary").innerHTML =
+      item("Emails sent", sent, leads != null ? `${fmt.format(leads)} leads` : "") +
+      item(t ? "Opened" : "Leads opened", opened, pctOf(opened, t ? t.unique_sent : leads)) +
+      item(t ? "Clicked" : "Leads clicked", clicked) +
+      item("Replies", replies, pctOf(replies, leads)) +
+      item("Bounced", t ? t.bounced : null, t ? pctOf(t.bounced, t.sent) : "") +
+      item("Unsubscribed", t ? t.unsubscribed : null);
+
+    const notes = [`Counted from 12:00 AM to 12:00 AM India time${sum?.isToday || date === today() ? " (today is still in progress)" : ""}.`];
+    if (!t) notes.push("Opens and clicks are counted from the lead lists below, and bounces aren't available, because this day doesn't have midnight snapshots at both ends.");
+    $("summary-note").textContent = notes.join(" ");
   }
 
   function renderList(kind, rows) {
