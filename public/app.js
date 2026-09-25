@@ -231,6 +231,9 @@
         .map(([id, s]) => ({
           id, name: byId[id]?.name || `Campaign ${id}`, status: byId[id]?.status || "UNKNOWN",
           plain_text: byId[id]?.plain_text, ...s,
+          // lead counts are current totals, not activity, so they come from the live data
+          leads_total: byId[id]?.leads_total, leads_not_started: byId[id]?.leads_not_started,
+          leads_in_progress: byId[id]?.leads_in_progress, leads_completed: byId[id]?.leads_completed,
         }));
     }
     if (state.status) rows = rows.filter((r) => r.status === state.status);
@@ -282,10 +285,14 @@
     });
 
     const active = rows.filter((r) => r.status === "ACTIVE").length;
+    const leadsTotal = rows.reduce((a, r) => a + (r.leads_total || 0), 0);
+    const leadsWaiting = rows.some((r) => r.leads_not_started != null)
+      ? rows.reduce((a, r) => a + (r.leads_not_started || 0), 0) : null;
     const periodLabel = state.range === "all" ? "all time" : `last ${state.range} days (incl. today)`;
     $("side-stats").innerHTML = `
       <div><dt>Bounced</dt><dd>${fmt.format(t.bounced)}<small>${fmtPct(pct(t.bounced, t.sent))}</small></dd></div>
       <div><dt>Unsubscribed</dt><dd>${fmt.format(t.unsubscribed)}<small>${fmtPct(pct(t.unsubscribed, base))}</small></dd></div>
+      <div><dt>Total leads</dt><dd>${fmt.format(leadsTotal)}<small>${leadsWaiting == null ? "" : `${fmt.format(leadsWaiting)} yet to start`}</small></dd></div>
       <div><dt>Campaigns shown</dt><dd>${rows.length}<small>${active} active</small></dd></div>
       <div><dt>Period</dt><dd style="font-size:1rem;font-weight:400">${periodLabel}</dd></div>`;
   }
@@ -389,6 +396,8 @@
       <tr>
         <td class="text name">${esc(r.name)}</td>
         <td class="text"><span class="status" data-s="${esc(r.status)}">${esc(titleCase(r.status))}</span></td>
+        <td>${r.leads_total == null ? "–" : n(r.leads_total)}</td>
+        <td>${r.leads_not_started == null ? `<span class="na">–</span>` : n(r.leads_not_started)}</td>
         <td>${n(r.sent)}</td>
         ${r.plain_text ? `<td class="na" title="Plain-text campaign: opens not tracked">–</td>` : `<td>${n(r.unique_opened)}</td>`}
         ${p(r.open_rate)}
@@ -408,7 +417,7 @@
 
   function exportCsv() {
     const rows = currentRows().filter((r) => !state.search || r.name.toLowerCase().includes(state.search));
-    const cols = ["name", "status", "sent", "unique_sent", "unique_opened", "open_rate", "clicked", "replied", "reply_rate", "bounced", "bounce_rate", "unsubscribed"];
+    const cols = ["name", "status", "leads_total", "leads_not_started", "leads_in_progress", "leads_completed", "sent", "unique_sent", "unique_opened", "open_rate", "clicked", "replied", "reply_rate", "bounced", "bounce_rate", "unsubscribed"];
     const cell = (v) => {
       if (v == null) return "";
       const s = typeof v === "number" && !Number.isInteger(v) ? v.toFixed(4) : String(v);
