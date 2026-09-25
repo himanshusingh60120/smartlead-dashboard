@@ -261,3 +261,6 @@ details.lead > summary:hover { background: color-mix(in srgb, var(--bg) 60%, tra
 .granularity button { font-size: 0.8125rem; padding: 0.3rem 0.7rem; }
 @media (max-width: 820px) { .granularity { width: auto; } .granularity button { flex: none; } }
 .stage-extra { margin: 0.35rem 0 0; font-size: 0.8125rem; color: var(--muted); }
+.day-summary dd.pending { color: var(--muted); animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .day-summary dd.pending { animation: none; } }
