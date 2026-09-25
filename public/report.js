@@ -73,7 +73,25 @@
 
   // ---------- Loading ----------
 
-  async function load(date) {
+  // Finished days: use the report saved by the nightly job (instant, complete).
+  // Today, or days without a saved report: build it live from Smartlead.
+  async function fetchReport(date, { live = false } = {}) {
+    if (!live && date < today()) {
+      try {
+        return await getJson(`/data/reports/${date}.json?t=${Date.now()}`);
+      } catch { /* not saved yet, fall through to live */ }
+    }
+    try {
+      return await getJson(`/api/report?date=${date}${live ? `&fresh=${Date.now()}` : ""}`);
+    } catch (err) {
+      if (/\(50[24]\)/.test(err.message)) {
+        throw new Error("Smartlead took too long to send this day's activity. Try again in a minute.");
+      }
+      throw err;
+    }
+  }
+
+  async function load(date, opts = {}) {
     const id = ++requestId;
     $("day").value = date;
     $("next-day").disabled = date >= today();
@@ -83,7 +101,7 @@
     $("notice").hidden = true;
     for (const k of ["replied", "clicked", "opened"]) { $(`${k}-list`).innerHTML = `<p class="empty">Loading…</p>`; $(`${k}-count`).textContent = ""; }
 
-    const [rep, sum] = await Promise.allSettled([getJson(`/api/report?date=${date}`), dayTotals(date)]);
+    const [rep, sum] = await Promise.allSettled([fetchReport(date, opts), dayTotals(date)]);
     if (id !== requestId) return; // a newer date was picked meanwhile
 
     renderSummary(sum.status === "fulfilled" ? sum.value : null, rep.status === "fulfilled" ? rep.value : null, date);
@@ -91,21 +109,38 @@
     if (rep.status === "rejected") {
       report = null;
       setStatus("error", longDate(date));
-      showNotice(`Couldn't load the lead lists: ${rep.reason.message}`);
+      showNotice(`Couldn't load the lead lists: ${rep.reason.message}`, { retry: true });
       for (const k of ["replied", "clicked", "opened"]) $(`${k}-list`).innerHTML = `<p class="empty">Not available.</p>`;
       return;
     }
     report = rep.value;
-    setStatus("live", `${longDate(date)} · loaded ${new Date(report.generated_at).toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })}`);
-    if (report.truncated) showNotice("This day had more activity than one load can fetch, so the lists are incomplete.");
+    const at = new Date(report.generated_at).toLocaleString(undefined, { timeZone: TIME_ZONE, day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
+    setStatus("live", report.source === "nightly"
+      ? `${longDate(date)} · saved ${at} IST`
+      : `${longDate(date)} · live, loaded ${at} IST`);
+    if (report.truncated) {
+      showNotice("Smartlead was slow, so this shows the activity loaded so far and the lists may be incomplete. Try again in a minute for the rest.", { retry: true });
+    } else if (report.source === "nightly") {
+      showNotice("Saved by the nightly job, so opens that came in after it ran aren't included.", { retry: true, retryLabel: "Load live from Smartlead" });
+    }
     renderList("replied", report.replied);
     renderList("clicked", report.clicked);
     renderList("opened", report.opened);
   }
 
-  function showNotice(text) {
-    $("notice").textContent = text;
-    $("notice").hidden = false;
+  function showNotice(text, { retry = false, retryLabel = "Try again" } = {}) {
+    const el = $("notice");
+    el.textContent = text;
+    if (retry) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "link-btn";
+      btn.style.marginLeft = "0.5rem";
+      btn.textContent = retryLabel;
+      btn.addEventListener("click", () => load($("day").value, { live: true }));
+      el.append(btn);
+    }
+    el.hidden = false;
   }
 
   // ---------- Rendering ----------
