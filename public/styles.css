@@ -11,6 +11,7 @@
   --clicked: #7a5ac8;
   --replied: #c47a0e;
   --bounced: #b3372e;
+  --leads: #5b6778;
   --focus: #2b4acb;
   --font: "IBM Plex Sans", "Segoe UI", system-ui, -apple-system, sans-serif;
 
@@ -33,6 +34,7 @@
     --clicked: #b39af0;
     --replied: #f0ac45;
     --bounced: #ec7a70;
+    --leads: #aab6c6;
     --focus: #7d95ff;
   }
 }
@@ -251,3 +253,10 @@ details.lead > summary:hover { background: color-mix(in srgb, var(--bg) 60%, tra
   .day-picker input { flex: 1; }
   .day-summary { padding: 1.25rem 1rem; }
 }
+
+/* Active campaigns highlight + chart granularity toggle */
+.side-stats .highlight dd { font-size: 1.75rem; font-weight: 300; color: var(--opened); line-height: 1.1; }
+.side-stats .highlight dd small { color: var(--muted); }
+.granularity { padding: 2px; }
+.granularity button { font-size: 0.8125rem; padding: 0.3rem 0.7rem; }
+@media (max-width: 820px) { .granularity { width: auto; } .granularity button { flex: none; } }
