@@ -131,7 +131,13 @@
       offset += chunk.received;
       finalize(report);
       onProgress(report, `${fmt.format(offset)} leads loaded`);
-      if (!chunk.hasMore || chunk.received === 0) break;
+      // Keep going until Smartlead returns an empty batch; its hasMore flag isn't always right.
+      // When a batch looks like the last one, confirm with one small extra request.
+      if (chunk.received === 0) break;
+      if (chunk.received < limit) {
+        limit = 25;
+        continue;
+      }
 
       // Tune the next batch so each request takes ~10s
       if (chunk.smartlead_ms > 0) {
