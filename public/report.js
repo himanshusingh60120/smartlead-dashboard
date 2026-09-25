@@ -26,9 +26,15 @@
   async function getJson(url) {
     const r = await fetch(url, { cache: "no-store" });
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(body.error || `Request failed (${r.status})`);
+    if (!r.ok) {
+      const err = new Error(body.error || `Request failed (${r.status})`);
+      err.status = r.status;
+      throw err;
+    }
     return body;
   }
+
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   function setStatus(kind, text) {
     $("live-dot").dataset.state = kind;
@@ -73,59 +79,122 @@
 
   // ---------- Loading ----------
 
-  // Finished days: use the report saved by the nightly job (instant, complete).
-  // Today, or days without a saved report: build it live from Smartlead.
-  async function fetchReport(date, { live = false } = {}) {
-    if (!live && date < today()) {
+  // ---------- Live report, fetched from Smartlead in batches ----------
+  // Each batch is its own short request, so none of them hits Vercel's time limit.
+  // If Smartlead is slow the batch size shrinks; if its 10-per-minute limit is hit, we wait and continue.
+
+  async function fetchLiveReport(date, isCurrent, onProgress) {
+    let offset = 0;
+    let limit = 200;
+    let failures = 0;
+    let partial = false;
+    const report = {
+      date, source: "live", truncated: false,
+      counts: { leads_with_activity: 0, sent_in_day: 0, leads_sent_in_day: 0, replies_in_day: 0 },
+      replied: [], clicked: [], opened: [],
+    };
+
+    while (isCurrent()) {
+      let chunk;
       try {
-        return await getJson(`/data/reports/${date}.json?t=${Date.now()}`);
-      } catch { /* not saved yet, fall through to live */ }
-    }
-    try {
-      return await getJson(`/api/report?date=${date}${live ? `&fresh=${Date.now()}` : ""}`);
-    } catch (err) {
-      if (/\(50[24]\)/.test(err.message)) {
-        throw new Error("Smartlead took too long to send this day's activity. Try again in a minute.");
+        chunk = await getJson(`/api/report?date=${date}&offset=${offset}&limit=${limit}&t=${Date.now()}`);
+        failures = 0;
+      } catch (err) {
+        if (err.status === 429) {
+          for (let s = 60; s > 0 && isCurrent(); s--) {
+            onProgress(report, `Smartlead's limit is 10 requests a minute. Continuing in ${s}s…`);
+            await sleep(1000);
+          }
+          continue;
+        }
+        if (err.status === 504 || err.status === 502 || err.status === 500 || !err.status) {
+          failures++;
+          limit = Math.max(25, Math.floor(limit / 2)); // smaller batch = faster answer
+          if (failures <= 4) {
+            onProgress(report, `Smartlead is slow, retrying with smaller batches (attempt ${failures + 1})…`);
+            await sleep(2000 * failures);
+            continue;
+          }
+        }
+        if (offset === 0) throw err;
+        partial = true; // keep what we have
+        break;
       }
-      throw err;
+
+      report.from = chunk.from;
+      report.to = chunk.to;
+      for (const k of Object.keys(report.counts)) report.counts[k] += chunk.counts[k] || 0;
+      report.replied.push(...chunk.replied);
+      report.clicked.push(...chunk.clicked);
+      report.opened.push(...chunk.opened);
+      offset += chunk.received;
+      finalize(report);
+      onProgress(report, `Fetching from Smartlead… ${fmt.format(offset)} leads so far`);
+      if (!chunk.hasMore || chunk.received === 0) break;
     }
+
+    report.truncated = partial;
+    report.generated_at = new Date().toISOString();
+    return finalize(report);
   }
 
-  async function load(date, opts = {}) {
+  function finalize(report) {
+    const uniq = (rows) => new Set(rows.map((r) => r.lead_id)).size;
+    report.counts.opened = uniq(report.opened);
+    report.counts.clicked = uniq(report.clicked);
+    report.counts.replied = uniq(report.replied);
+    report.replied.sort((a, b) => new Date(b.reply_time) - new Date(a.reply_time));
+    report.clicked.sort((a, b) => b.clicks - a.clicks);
+    report.opened.sort((a, b) => b.opens - a.opens);
+    return report;
+  }
+
+  async function load(date) {
     const id = ++requestId;
+    const isCurrent = () => id === requestId;
     $("day").value = date;
     $("next-day").disabled = date >= today();
     history.replaceState(null, "", `?date=${date}`);
     $("report-title").textContent = date === today() ? "Today so far" : date === addDays(today(), -1) ? "Yesterday" : "Daily report";
-    setStatus("loading", `Loading ${longDate(date)}…`);
+    setStatus("loading", `Fetching ${longDate(date)} from Smartlead…`);
     $("notice").hidden = true;
+    $("refresh").disabled = true;
     for (const k of ["replied", "clicked", "opened"]) { $(`${k}-list`).innerHTML = `<p class="empty">Loading…</p>`; $(`${k}-count`).textContent = ""; }
 
-    const [rep, sum] = await Promise.allSettled([fetchReport(date, opts), dayTotals(date)]);
-    if (id !== requestId) return; // a newer date was picked meanwhile
+    const sumP = dayTotals(date).catch(() => null);
+    let sum = null;
+    sumP.then((v) => { sum = v; });
 
-    renderSummary(sum.status === "fulfilled" ? sum.value : null, rep.status === "fulfilled" ? rep.value : null, date);
+    const draw = (rep) => {
+      renderSummary(sum, rep, date);
+      renderList("replied", rep.replied);
+      renderList("clicked", rep.clicked);
+      renderList("opened", rep.opened);
+    };
 
-    if (rep.status === "rejected") {
+    try {
+      const rep = await fetchLiveReport(date, isCurrent, (partialRep, msg) => {
+        if (!isCurrent()) return;
+        setStatus("loading", msg);
+        if (partialRep.counts.leads_with_activity) draw(partialRep);
+      });
+      if (!isCurrent()) return;
+      sum = await sumP;
+      report = rep;
+      draw(rep);
+      const at = new Date(rep.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" });
+      setStatus("live", `${longDate(date)} · live from Smartlead, ${at} IST`);
+      if (rep.truncated) showNotice("Smartlead stopped responding part-way, so the lists may be incomplete.", { retry: true });
+    } catch (err) {
+      if (!isCurrent()) return;
       report = null;
+      renderSummary(await sumP, null, date);
       setStatus("error", longDate(date));
-      showNotice(`Couldn't load the lead lists: ${rep.reason.message}`, { retry: true });
+      showNotice(`Couldn't load the lead lists: ${err.status === 504 || err.status === 502 ? "Smartlead isn't responding right now." : err.message}`, { retry: true });
       for (const k of ["replied", "clicked", "opened"]) $(`${k}-list`).innerHTML = `<p class="empty">Not available.</p>`;
-      return;
+    } finally {
+      if (isCurrent()) $("refresh").disabled = false;
     }
-    report = rep.value;
-    const at = new Date(report.generated_at).toLocaleString(undefined, { timeZone: TIME_ZONE, day: "numeric", month: "short", hour: "numeric", minute: "2-digit" });
-    setStatus("live", report.source === "nightly"
-      ? `${longDate(date)} · saved ${at} IST`
-      : `${longDate(date)} · live, loaded ${at} IST`);
-    if (report.truncated) {
-      showNotice("Smartlead was slow, so this shows the activity loaded so far and the lists may be incomplete. Try again in a minute for the rest.", { retry: true });
-    } else if (report.source === "nightly") {
-      showNotice("Saved by the nightly job, so opens that came in after it ran aren't included.", { retry: true, retryLabel: "Load live from Smartlead" });
-    }
-    renderList("replied", report.replied);
-    renderList("clicked", report.clicked);
-    renderList("opened", report.opened);
   }
 
   function showNotice(text, { retry = false, retryLabel = "Try again" } = {}) {
@@ -137,7 +206,7 @@
       btn.className = "link-btn";
       btn.style.marginLeft = "0.5rem";
       btn.textContent = retryLabel;
-      btn.addEventListener("click", () => load($("day").value, { live: true }));
+      btn.addEventListener("click", () => load($("day").value));
       el.append(btn);
     }
     el.hidden = false;
@@ -301,6 +370,7 @@
   $("prev-day").addEventListener("click", () => load(addDays($("day").value, -1)));
   $("next-day").addEventListener("click", () => load(addDays($("day").value, 1)));
   $("export-csv").addEventListener("click", exportCsv);
+  $("refresh").addEventListener("click", () => load($("day").value));
 
   load(initial);
 })();
