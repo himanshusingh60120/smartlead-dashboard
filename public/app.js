@@ -9,6 +9,7 @@
   let data = null;      // { updated_at, live, campaigns, error? }
   let snapshots = [];   // daily snapshots from history.json (totals at the start of each day)
   let deltas = [];      // [{ date, campaigns: { id: { metric: n } } }]
+  let baseline = null;  // last nightly copy (latest.json), used to show leads added since then
   let chart = null;
   let loading = false;
   let timer = null;
@@ -37,18 +38,16 @@
     $("refresh").disabled = true;
 
     const historyP = getJson(`/data/history.json?t=${Date.now()}`).catch(() => ({ snapshots: [] }));
+    const savedP = getJson(`/data/latest.json?t=${Date.now()}`).catch(() => null);
     try {
-      const live = await getJson(`/api/stats${fresh ? `?fresh=${Date.now()}` : ""}`);
+      const live = await getJson(`/api/stats?fresh=${Date.now()}`);
       data = { ...live, live: true };
     } catch (err) {
       // Live API unavailable: fall back to the last nightly copy.
-      try {
-        const saved = await getJson(`/data/latest.json?t=${Date.now()}`);
-        data = { ...saved, live: false, error: err.message };
-      } catch {
-        data = { campaigns: [], live: false, error: err.message };
-      }
+      const saved = await savedP;
+      data = saved ? { ...saved, live: false, error: err.message } : { campaigns: [], live: false, error: err.message };
     }
+    baseline = await savedP;
     snapshots = ((await historyP).snapshots || []).sort((a, b) => a.date.localeCompare(b.date));
     deltas = buildDeltas(snapshots, data.live ? data.campaigns : null, data.campaigns);
 
@@ -282,10 +281,24 @@
     const leadsHidden = hidden.reduce((a, c) => a + (c.leads_total || 0), 0);
     const scale = leadsTotal || base; // bars are drawn relative to total leads
 
+    // Leads added (net) across ALL campaigns since the last nightly snapshot, so new uploads
+    // show up right away even when they go into a paused, drafted or brand-new campaign.
+    let addedNote = "";
+    if (data.live && baseline?.campaigns?.length) {
+      const before = Object.fromEntries(baseline.campaigns.map((c) => [String(c.id), c.leads_total || 0]));
+      const scope = (data.campaigns || []).filter((c) => !state.status || c.status === state.status);
+      const change = scope.reduce((a, c) => a + (c.leads_total || 0) - (before[String(c.id)] || 0), 0);
+      const since = new Date(baseline.updated_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+      addedNote = `${change >= 0 ? "+" : "−"}${fmt.format(Math.abs(change))} lead${Math.abs(change) === 1 ? "" : "s"} added since the nightly snapshot (${since})`;
+    }
+
     const stages = [
       { label: `Total leads · ${rows.length} campaign${rows.length === 1 ? "" : "s"}`, value: leadsTotal, color: "--leads",
         note: leadsWaiting == null ? "uploaded to campaigns" : `${fmt.format(leadsWaiting)} yet to start`, width: leadsTotal > 0 ? 1 : 0,
-        extra: leadsHidden ? `+ ${fmt.format(leadsHidden)} more in ${hidden.length} other campaign${hidden.length === 1 ? "" : "s"} (paused or no activity in this period)` : "" },
+        extra: [
+          leadsHidden ? `+ ${fmt.format(leadsHidden)} more in ${hidden.length} other campaign${hidden.length === 1 ? "" : "s"} (paused or no activity in this period)` : "",
+          addedNote,
+        ].filter(Boolean).join("<br>") },
       { label: "Emails sent", value: t.sent, color: "--sent",
         note: `${fmt.format(t.unique_sent)} leads contacted${leadsTotal ? ` · ${fmtPct(pct(t.unique_sent, leadsTotal))} of leads` : ""}`, width: pct(t.unique_sent, scale) },
       { label: "Opened", value: t.unique_opened, color: "--opened", note: `${fmtPct(pct(t.unique_opened, base))} open rate`, width: pct(t.unique_opened, scale) },
