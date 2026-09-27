@@ -14,9 +14,8 @@ export default async function handler(req, res) {
 
   try {
     const { campaigns, failed } = await fetchAllCampaignStats(apiKey);
-    // Vercel's edge cache keeps the answer for 60s, so many viewers don't each hit Smartlead.
-    // The Refresh button adds ?fresh=… to skip the cache.
-    res.setHeader("Cache-Control", "public, s-maxage=60, stale-while-revalidate=300");
+    // Never cache: every page load, reload and Refresh gets numbers straight from Smartlead.
+    res.setHeader("Cache-Control", "no-store");
     res.status(200).json({
       updated_at: new Date().toISOString(),
       live: true,
