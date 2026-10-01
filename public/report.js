@@ -91,7 +91,7 @@
     let partial = false;
     const report = {
       date, source: "live", truncated: false,
-      counts: { leads_with_activity: 0, sent_in_day: 0, leads_sent_in_day: 0, replies_in_day: 0 },
+      counts: { leads_with_activity: 0, sent_in_day: 0, leads_sent_in_day: 0, replies_in_day: 0, touched_by_step: {} },
       replied: [], clicked: [], opened: [],
     };
 
@@ -124,7 +124,13 @@
 
       report.from = chunk.from;
       report.to = chunk.to;
-      for (const k of Object.keys(report.counts)) report.counts[k] += chunk.counts[k] || 0;
+      for (const k of Object.keys(report.counts)) {
+        if (k === "touched_by_step") continue;
+        report.counts[k] += chunk.counts[k] || 0;
+      }
+      for (const [step, n] of Object.entries(chunk.counts.touched_by_step || {})) {
+        report.counts.touched_by_step[step] = (report.counts.touched_by_step[step] || 0) + n;
+      }
       report.replied.push(...chunk.replied);
       report.clicked.push(...chunk.clicked);
       report.opened.push(...chunk.opened);
@@ -284,6 +290,7 @@
       $("summary").innerHTML = ["Emails sent", "Leads opened", "Leads clicked", "Replies", "Bounced", "Unsubscribed"]
         .map((l) => `<div><dt>${l}</dt><dd class="pending">…</dd></div>`).join("");
       $("summary-note").textContent = "Counted from 12:00 AM to 12:00 AM India time.";
+      renderSteps(null, { loading: true });
       return;
     }
     const t = sum?.totals;
@@ -303,7 +310,8 @@
 
     lastSummary = [
       ["Emails sent", sent, "exact, from send timestamps"],
-      ["Leads contacted", leads, ""],
+      ["Unique emails touched", leads, "all steps"],
+      ...stepRows(c).map(([label, n]) => [`Unique emails touched · ${label}`, n, ""]),
       [t ? "Opened (unique)" : "Leads opened", opened, t ? `open rate ${pctOf(opened, t.unique_sent) || "–"}` : "from lead activity"],
       [t ? "Clicks" : "Leads clicked", clicked, ""],
       ["Replies", replies, `reply rate ${pctOf(replies, leads) || "–"}`],
@@ -321,9 +329,33 @@
       item("Bounced", t ? t.bounced : null, t ? pctOf(t.bounced, t.sent) : "") +
       item("Unsubscribed", t ? t.unsubscribed : null);
 
+    renderSteps(c);
+
     const notes = [`Counted from 12:00 AM to 12:00 AM India time${sum?.isToday || date === today() ? " (today is still in progress)" : ""}.`];
     if (!t) notes.push("Opens and clicks are counted from the lead lists below, and bounces aren't available, because this day doesn't have midnight snapshots at both ends.");
     $("summary-note").textContent = notes.join(" ");
+  }
+
+  // E1–E4 are always shown; later steps (E5, E6, …) appear when something was sent for them.
+  function stepRows(c) {
+    const by = c?.touched_by_step;
+    if (!by) return [1, 2, 3, 4].map((n) => [`E${n}`, null]);
+    const steps = new Set(["1", "2", "3", "4", ...Object.keys(by)]);
+    return [...steps]
+      .sort((a, b) => (Number(a) || 999) - (Number(b) || 999))
+      .map((k) => [k === "?" ? "Unknown step" : `E${k}`, by[k] || 0]);
+  }
+
+  function renderSteps(c, { loading = false } = {}) {
+    const rows = loading ? [1, 2, 3, 4].map((n) => [`E${n}`, undefined]) : stepRows(c);
+    const total = loading ? undefined : (c?.leads_sent_in_day ?? null);
+    const cell = (label, v, sub = "") =>
+      v === undefined
+        ? `<div><dt>${label}</dt><dd class="pending">…</dd></div>`
+        : `<div><dt>${label}</dt><dd>${v == null ? "–" : fmt.format(v)}${sub ? `<small>${sub}</small>` : ""}</dd></div>`;
+    $("steps").innerHTML =
+      rows.map(([label, n]) => cell(label, n)).join("") +
+      cell("Total unique", total, "all steps");
   }
 
   function renderList(kind, rows) {
