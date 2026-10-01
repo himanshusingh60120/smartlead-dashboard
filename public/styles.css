@@ -264,3 +264,16 @@ details.lead > summary:hover { background: color-mix(in srgb, var(--bg) 60%, tra
 .day-summary dd.pending { color: var(--muted); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.35; } }
 @media (prefers-reduced-motion: reduce) { .day-summary dd.pending { animation: none; } }
+
+/* Daily report: per-step breakdown */
+.step-table th, .step-table td { padding: 0.55rem 0.75rem; }
+.step-table thead th { cursor: default; }
+.step-table thead th:hover { color: var(--muted); }
+.step-table thead th.k-opened { color: var(--opened); }
+.step-table thead th.k-replied { color: var(--replied); }
+.step-table tbody th { font-weight: 500; }
+.step-table td { font-size: 1rem; }
+.step-table td.rate { color: var(--muted); font-size: 0.8125rem; }
+.step-table tfoot tr td, .step-table tfoot tr th { border-top: 1px solid var(--muted); font-weight: 600; }
+.step-table .pending { color: var(--muted); animation: pulse 1.2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .step-table .pending { animation: none; } }
