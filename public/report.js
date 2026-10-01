@@ -20,7 +20,7 @@
   const longDate = (date) => new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
 
   let report = null;
-  let lastSummary = []; // [label, value, note] rows for the CSV
+  let lastSummary = null; // { sent, steps } used by the CSV export
   let requestId = 0;
 
   async function getJson(url) {
@@ -91,7 +91,7 @@
     let partial = false;
     const report = {
       date, source: "live", truncated: false,
-      counts: { leads_with_activity: 0, sent_in_day: 0, leads_sent_in_day: 0, replies_in_day: 0, touched_by_step: {} },
+      counts: { leads_with_activity: 0, sent_in_day: 0, leads_sent_in_day: 0, replies_in_day: 0, touched_by_step: {}, replies_by_step: {} },
       replied: [], clicked: [], opened: [],
     };
 
@@ -125,11 +125,13 @@
       report.from = chunk.from;
       report.to = chunk.to;
       for (const k of Object.keys(report.counts)) {
-        if (k === "touched_by_step") continue;
+        if (k === "touched_by_step" || k === "replies_by_step") continue;
         report.counts[k] += chunk.counts[k] || 0;
       }
-      for (const [step, n] of Object.entries(chunk.counts.touched_by_step || {})) {
-        report.counts.touched_by_step[step] = (report.counts.touched_by_step[step] || 0) + n;
+      for (const k of ["touched_by_step", "replies_by_step"]) {
+        for (const [step, n] of Object.entries(chunk.counts[k] || {})) {
+          report.counts[k][step] = (report.counts[k][step] || 0) + n;
+        }
       }
       report.replied.push(...chunk.replied);
       report.clicked.push(...chunk.clicked);
@@ -308,19 +310,8 @@
     const opened = t ? t.unique_opened : c?.opened;
     const clicked = t ? t.clicked : c?.clicked;
 
-    lastSummary = [
-      ["Emails sent", sent, "exact, from send timestamps"],
-      ["Unique emails touched", leads, "all steps"],
-      ...stepRows(c).map(([label, n]) => [`Unique emails touched · ${label}`, n, ""]),
-      [t ? "Opened (unique)" : "Leads opened", opened, t ? `open rate ${pctOf(opened, t.unique_sent) || "–"}` : "from lead activity"],
-      [t ? "Clicks" : "Leads clicked", clicked, ""],
-      ["Replies", replies, `reply rate ${pctOf(replies, leads) || "–"}`],
-      ["Bounced", t ? t.bounced : null, t ? "" : "not available for this day"],
-      ["Unsubscribed", t ? t.unsubscribed : null, t ? "" : "not available for this day"],
-      ["Leads who opened", c?.opened, "listed below"],
-      ["Leads who clicked", c?.clicked, "listed below"],
-      ["Leads who replied", c?.replied, "listed below"],
-    ];
+    const steps = stepBreakdown(rep, t);
+    lastSummary = { sent, steps };
     $("summary").innerHTML =
       item("Emails sent", sent, leads != null ? `${fmt.format(leads)} leads` : "") +
       item(t ? "Opened" : "Leads opened", opened, pctOf(opened, t ? t.unique_sent : leads)) +
@@ -329,33 +320,101 @@
       item("Bounced", t ? t.bounced : null, t ? pctOf(t.bounced, t.sent) : "") +
       item("Unsubscribed", t ? t.unsubscribed : null);
 
-    renderSteps(c);
+    renderSteps(steps);
 
     const notes = [`Counted from 12:00 AM to 12:00 AM India time${sum?.isToday || date === today() ? " (today is still in progress)" : ""}.`];
     if (!t) notes.push("Opens and clicks are counted from the lead lists below, and bounces aren't available, because this day doesn't have midnight snapshots at both ends.");
     $("summary-note").textContent = notes.join(" ");
   }
 
-  // E1–E4 are always shown; later steps (E5, E6, …) appear when something was sent for them.
-  function stepRows(c) {
-    const by = c?.touched_by_step;
-    if (!by) return [1, 2, 3, 4].map((n) => [`E${n}`, null]);
-    const steps = new Set(["1", "2", "3", "4", ...Object.keys(by)]);
-    return [...steps]
+  // ---------- Per-step breakdown (E1, E2, …) ----------
+  // E1–E4 are always shown; later steps (E5, E6, …) appear when there's something to show for them.
+  // touched: unique email addresses sent that step this day (from send timestamps)
+  // opened / clicked: unique leads in the lists below, by the step of the email they opened / clicked
+  // replies: replies received this day, by the step they replied to
+  // bounced / unsubscribed: Smartlead only reports these per campaign, so they're day totals only
+  function stepBreakdown(rep, t) {
+    const c = rep?.counts;
+    const uniqBy = (rows) => {
+      const by = {};
+      for (const r of rows || []) (by[stepKey(r.seq)] ||= new Set()).add(r.lead_id);
+      return Object.fromEntries(Object.entries(by).map(([k, v]) => [k, v.size]));
+    };
+    const touched = c?.touched_by_step || {};
+    const opened = uniqBy(rep?.opened);
+    const clicked = uniqBy(rep?.clicked);
+    // Reports cached before replies_by_step existed fall back to unique leads who replied
+    const replies = c?.replies_by_step || uniqBy(rep?.replied);
+    const keys = new Set(["1", "2", "3", "4", ...[touched, opened, clicked, replies].flatMap(Object.keys)]);
+    const has = Boolean(c);
+
+    const rows = [...keys]
       .sort((a, b) => (Number(a) || 999) - (Number(b) || 999))
-      .map((k) => [k === "?" ? "Unknown step" : `E${k}`, by[k] || 0]);
+      .map((k) => ({
+        key: k,
+        label: k === "?" ? "Unknown step" : `E${k}`,
+        touched: has ? touched[k] || 0 : null,
+        opened: has ? opened[k] || 0 : null,
+        clicked: has ? clicked[k] || 0 : null,
+        replies: has ? replies[k] || 0 : null,
+        bounced: null,
+        unsubscribed: null,
+      }));
+
+    const total = {
+      key: "all",
+      label: "All steps",
+      touched: c?.leads_sent_in_day ?? null,
+      opened: c?.opened ?? null,
+      clicked: c?.clicked ?? null,
+      replies: c ? c.replies_in_day ?? c.replied ?? null : null,
+      bounced: t ? t.bounced : null,
+      unsubscribed: t ? t.unsubscribed : null,
+    };
+    return { total, rows };
   }
 
-  function renderSteps(c, { loading = false } = {}) {
-    const rows = loading ? [1, 2, 3, 4].map((n) => [`E${n}`, undefined]) : stepRows(c);
-    const total = loading ? undefined : (c?.leads_sent_in_day ?? null);
-    const cell = (label, v, sub = "") =>
-      v === undefined
-        ? `<div><dt>${label}</dt><dd class="pending">…</dd></div>`
-        : `<div><dt>${label}</dt><dd>${v == null ? "–" : fmt.format(v)}${sub ? `<small>${sub}</small>` : ""}</dd></div>`;
-    $("steps").innerHTML =
-      rows.map(([label, n]) => cell(label, n)).join("") +
-      cell("Total unique", total, "all steps");
+  function stepKey(seq) {
+    return String(Number(seq) || "?");
+  }
+
+  function renderSteps(steps, { loading = false } = {}) {
+    const el = $("steps");
+    const pct = (n, d) => (n != null && d > 0 ? `${((n / d) * 100).toFixed(1)}%` : "");
+    const num = (v) => (loading ? `<span class="pending">…</span>` : v == null ? "–" : fmt.format(v));
+    const rate = (n, d) => (loading ? "" : pct(n, d));
+
+    const data = loading
+      ? { total: { label: "All steps" }, rows: [1, 2, 3, 4].map((n) => ({ label: `E${n}` })) }
+      : steps;
+
+    const tr = (r, isTotal = false) => `
+      <tr${isTotal ? ' class="total"' : ""}>
+        <th scope="row" class="text">${esc(r.label)}</th>
+        <td>${num(r.touched)}</td>
+        <td class="k-opened">${num(r.opened)}</td>
+        <td class="rate">${rate(r.opened, r.touched)}</td>
+        <td class="k-replied">${num(r.replies)}</td>
+        <td class="rate">${rate(r.replies, r.touched)}</td>
+      </tr>`;
+
+    el.innerHTML = `
+      <div class="table-scroll">
+        <table class="step-table">
+          <thead>
+            <tr>
+              <th scope="col" class="text">Step</th>
+              <th scope="col">Emails touched</th>
+              <th scope="col" class="k-opened">Opened</th>
+              <th scope="col">Open rate</th>
+              <th scope="col" class="k-replied">Replies</th>
+              <th scope="col">Reply rate</th>
+            </tr>
+          </thead>
+          <tbody>${data.rows.map((r) => tr(r)).join("")}</tbody>
+          <tfoot>${tr(data.total, true)}</tfoot>
+        </table>
+      </div>`;
   }
 
   function renderList(kind, rows) {
@@ -428,6 +487,8 @@
       (b.reply_time ? 1 : 0) - (a.reply_time ? 1 : 0) || b.clicks - a.clicks || b.opens - a.opens);
 
     const d = report.date;
+    const sum = lastSummary || { sent: report.counts?.sent_in_day, steps: stepBreakdown(report, null) };
+    const stepLine = (label, r) => line([label, r.touched, r.opened, r.clicked, r.replies, r.bounced, r.unsubscribed]);
     const out = [
       line(["Smartlead daily report"]),
       line(["Date", longDate(d)]),
@@ -435,7 +496,13 @@
       line(["Exported at (IST)", ist(new Date().toISOString())]),
       "",
       line(["Metric", "Value", "Note"]),
-      ...lastSummary.map(([label, value, note]) => line([label, value ?? "", note])),
+      line(["Emails sent", sum.sent, "exact, from send timestamps"]),
+      "",
+      line(["", "Total Count", "Leads opened", "Leads clicked", "Replies", "Bounced", "Unsubscribed"]),
+      stepLine("Unique emails touched", sum.steps.total),
+      ...sum.steps.rows.map((r) => stepLine(`Unique emails touched · ${r.label}`, r)),
+      "",
+      "",
       "",
       line([
         "Engagement", "Lead email", "Lead status", "Campaign", "Campaign ID", "Sequence step", "Subject",
