@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-10-13T00:55:16.527Z",
-  "date": "2026-10-13",
+  "updated_at": "2026-10-13T23:01:27.286Z",
+  "date": "2026-10-14",
   "time_zone": "Asia/Kolkata",
   "campaigns": [
     {
@@ -242,7 +242,7 @@
       "plain_text": false,
       "sent": 1040,
       "unique_sent": 269,
-      "opened": 182,
+      "opened": 183,
       "unique_opened": 58,
       "clicked": 0,
       "unique_clicked": 0,
@@ -426,7 +426,7 @@
       "plain_text": false,
       "sent": 1328,
       "unique_sent": 347,
-      "opened": 408,
+      "opened": 409,
       "unique_opened": 173,
       "clicked": 0,
       "unique_clicked": 0,
@@ -472,7 +472,7 @@
       "plain_text": false,
       "sent": 3098,
       "unique_sent": 828,
-      "opened": 326,
+      "opened": 327,
       "unique_opened": 130,
       "clicked": 0,
       "unique_clicked": 0,
