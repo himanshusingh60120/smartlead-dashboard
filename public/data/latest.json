@@ -1,6 +1,6 @@
 {
-  "updated_at": "2026-10-14T21:52:57.992Z",
-  "date": "2026-10-15",
+  "updated_at": "2026-10-15T21:39:16.465Z",
+  "date": "2026-10-16",
   "time_zone": "Asia/Kolkata",
   "campaigns": [
     {
@@ -242,7 +242,7 @@
       "plain_text": false,
       "sent": 1040,
       "unique_sent": 269,
-      "opened": 184,
+      "opened": 187,
       "unique_opened": 59,
       "clicked": 0,
       "unique_clicked": 0,
