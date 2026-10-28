@@ -7,14 +7,19 @@
   const PAGE = 50;
   const MAX_RANGE_DAYS = 93; // keep in sync with lib/report.js
 
-  // Long windows are loaded in pieces. Start with a week per piece; if Smartlead struggles,
-  // pieces get smaller (down to one day) and stay that size for the rest of the visit.
-  const START_PIECE_DAYS = 7;
-  let pieceDays = START_PIECE_DAYS;
+  // ---------- Loading speed ----------
+  // Smartlead allows only 10 requests a minute here, so each request should carry as many leads
+  // as possible (up to 1,000). Batches aim for ~30s each and only shrink when a request fails.
+  // Long windows are split into pieces of a few days, loaded 3 at a time.
+  const BATCH = { min: 50, max: 1000, target: 30000 };
+  let batchLimit = 500;
+  const START_PIECE_DAYS = 3;
+  let pieceDays = START_PIECE_DAYS; // shrinks if Smartlead struggles, for the rest of this visit
+  const PARALLEL = 3;
 
   // Reply categories in display order. Keys must match lib/reply-categories.js.
   const REPLY_GROUPS = [
-    { key: "positive", label: "Positive", cats: ["interested", "meeting", "info", "referral"] },
+    { key: "positive", label: "Positive", cats: ["interested", "meeting", "info"] },
     { key: "negative", label: "Negative", cats: ["not_interested", "not_now", "unsubscribe", "out_of_office", "vacation", "wrong_person", "bounce"] },
     { key: "review", label: "Needs review", cats: ["review"] },
   ];
@@ -22,7 +27,6 @@
     interested: "Interested",
     meeting: "Meeting request",
     info: "Information request",
-    referral: "Referral to someone else",
     not_interested: "Not interested",
     not_now: "Not now / later",
     unsubscribe: "Remove me / unsubscribe",
@@ -37,7 +41,10 @@
   const GROUP_RANK = { positive: 0, negative: 1, review: 2 };
   const AUTO_REPLIES = new Set(["out_of_office", "vacation", "bounce"]);
   const SOURCE_LABEL = { smartlead: "tagged in Smartlead", "reply text": "matched from the reply", none: "no match, check by hand" };
-  const catOf = (r) => (CAT_LABELS[r?.reply_category] ? r.reply_category : "review");
+  const catOf = (r) => {
+    if (r?.reply_category === "referral") return "not_interested"; // older results
+    return CAT_LABELS[r?.reply_category] ? r.reply_category : "review";
+  };
   const groupOf = (r) => GROUP_OF[catOf(r)];
 
   const $ = (id) => document.getElementById(id);
@@ -59,6 +66,11 @@
   const dayMonth = (date) => new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" });
   const pieceLabel = (s) => (s.from === s.to ? dayMonth(s.from) : `${dayMonth(s.from)}–${dayMonth(s.to)}`);
   const pctOf = (n, d) => (n != null && d > 0 ? `${((n / d) * 100).toFixed(1)}%` : "");
+  const dur = (secs) => {
+    if (secs < 90) return `${secs}s`;
+    if (secs < 3600) return `${Math.round(secs / 60)} min`;
+    return `${Math.floor(secs / 3600)} h ${Math.round((secs % 3600) / 60)} min`;
+  };
 
   let report = null;      // last loaded report for the window on screen, used by the CSV export
   let shown = null;       // report currently drawn (may still be loading)
@@ -173,7 +185,7 @@
   }
 
   // ---------- Pacing: Smartlead allows 10 lead-activity requests a minute ----------
-  // We stay one under the limit, so normally there's no 60-second penalty to wait out.
+  // We stay one under the limit (across all parallel loads), so there's no 60-second penalty to wait out.
   const RATE = { max: 9, windowMs: 61000 };
   const recentStarts = [];
   async function waitForTurn(isCurrent, onWait) {
@@ -301,20 +313,19 @@
   }
 
   // ---------- Live data, fetched from Smartlead ----------
-  // One piece of the window, batch by batch. Each batch is its own short request, so none of
-  // them hits Vercel's time limit. Throws an error with .splittable when a multi-day piece
-  // should be retried as smaller pieces.
-  async function fetchPiece(seg, isCurrent, progress) {
-    const TARGET_MS = 10000; // aim for ~10s per Smartlead request
-    const part = emptyPart();
+  // Loads one piece of the window into `part`, batch by batch.
+  // When a request fails: first smaller batches at the same spot, then (for multi-day pieces) an
+  // error with .splittable so the piece is retried as shorter ranges, then a few retries for one day.
+  async function fetchPiece(seg, part, isCurrent, progress) {
     const multiDay = daysBetween(seg.from, seg.to) > 1;
     let offset = 0;
-    let limit = 100;
     let failures = 0;
+    let checkedEnd = false;
 
     while (isCurrent()) {
-      await waitForTurn(isCurrent, (s) => progress(`pacing for Smartlead's 10-a-minute limit, next request in ${s}s`, part));
+      await waitForTurn(isCurrent, (s) => progress(`pacing for Smartlead's 10-a-minute limit, next request in ${s}s`));
       if (!isCurrent()) break;
+      const limit = batchLimit;
 
       let chunk;
       try {
@@ -323,22 +334,27 @@
       } catch (err) {
         if (err.status === 429) {
           for (let s = 60; s > 0 && isCurrent(); s--) {
-            progress(`Smartlead's rate limit was hit, continuing in ${s}s`, part);
+            progress(`Smartlead's rate limit was hit, continuing in ${s}s`);
             await sleep(1000);
           }
           continue;
         }
         if (err.status === 400) throw err; // the request itself is wrong; retrying won't help
+        if (limit > 100) {
+          batchLimit = Math.max(BATCH.min, Math.floor(limit / 2));
+          progress("Smartlead is slow, using smaller batches");
+          continue;
+        }
         if (multiDay) {
           const e = new Error(err.message);
           e.splittable = true;
           throw e;
         }
         failures++;
-        if (failures <= 4) {
-          limit = Math.max(25, Math.floor(limit / 2)); // smaller batch = faster answer
-          progress("Smartlead is slow, retrying with smaller batches", part);
-          await sleep(1500 * failures);
+        if (failures <= 3) {
+          batchLimit = Math.max(BATCH.min, Math.floor(limit / 2));
+          progress("Smartlead is slow, retrying");
+          await sleep(2000 * failures);
           continue;
         }
         throw err;
@@ -346,59 +362,74 @@
 
       addChunk(part, chunk);
       offset += chunk.received;
-      progress("", part);
+      progress("");
 
-      // Keep going until Smartlead returns an empty batch; its hasMore flag isn't always right.
-      // When a batch looks like the last one, confirm with one small extra request.
       if (chunk.received === 0) break;
-      if (chunk.received < limit) {
-        limit = 25;
+      const short = chunk.received < limit;
+      if (short) {
+        // A short page is normally the last one. Stop if Smartlead agrees; if it didn't say, check once.
+        if (chunk.hasMore === false || checkedEnd) break;
+        if (chunk.hasMore == null) checkedEnd = true;
         continue;
       }
-      // Tune the next batch so each request takes ~10s
+      // Full page: size the next batch so a request takes about BATCH.target ms
       if (chunk.smartlead_ms > 0) {
-        limit = Math.round(Math.min(500, Math.max(25, limit * (TARGET_MS / chunk.smartlead_ms), limit / 2)));
+        const next = limit * (BATCH.target / chunk.smartlead_ms);
+        batchLimit = Math.round(Math.min(BATCH.max, Math.max(BATCH.min, limit / 2, Math.min(next, limit * 2))));
       }
     }
-    return part;
   }
 
-  // Works through the queue of pieces. Pieces that can't be loaded at all are recorded in
-  // run.problems (the rest of the window still loads) so they can be retried on their own.
+  // Works through the queue of pieces, PARALLEL at a time. Pieces that can't be loaded at all are
+  // recorded in run.problems (the rest of the window still loads) so they can be retried on their own.
   async function runPieces(run, queue, isCurrent, onProgress, onPiece) {
     const totalDays = daysBetween(run.win.from, run.win.to);
-    while (queue.length && isCurrent()) {
-      const seg = queue.shift();
-      const progress = (msg, part) => {
-        const leads = run.all.sums.leads_with_activity + (part ? part.sums.leads_with_activity : 0);
-        const where = totalDays > 1 ? `${pieceLabel(seg)} · ${fmt.format(run.doneDays)} of ${fmt.format(totalDays)} days done · ` : "";
-        onProgress(`${where}${fmt.format(leads)} leads loaded${msg ? ` · ${msg}` : ""}`);
-      };
-      try {
-        const part = await fetchPiece(seg, isCurrent, progress);
-        if (!isCurrent()) return;
-        mergePart(run.all, part);
-        run.doneDays += daysBetween(seg.from, seg.to);
-      } catch (err) {
-        if (!isCurrent()) return;
-        if (err.splittable) {
-          // Smartlead couldn't handle a piece this long: make this and every later piece smaller
-          pieceDays = Math.max(1, Math.min(pieceDays, Math.floor(daysBetween(seg.from, seg.to) / 2)));
-          const rebuilt = [
-            ...splitWindow(seg, pieceDays),
-            ...queue.flatMap((s) => (daysBetween(s.from, s.to) > pieceDays ? splitWindow(s, pieceDays) : [s])),
-          ];
-          queue.length = 0;
-          queue.push(...rebuilt);
-          progress("Smartlead was slow, loading in smaller pieces", null);
-          continue;
+    const active = new Set();
+    let fatal = null;
+
+    const status = (msg) => {
+      let leads = run.all.sums.leads_with_activity;
+      for (const p of active) leads += p.sums.leads_with_activity;
+      const where = totalDays > 1 ? `${fmt.format(run.doneDays)} of ${fmt.format(totalDays)} days done · ` : "";
+      onProgress(`${where}${fmt.format(leads)} leads loaded${msg ? ` · ${msg}` : ""}`);
+    };
+
+    async function worker() {
+      while (queue.length && isCurrent() && !fatal) {
+        const seg = queue.shift();
+        const part = emptyPart();
+        active.add(part);
+        try {
+          await fetchPiece(seg, part, isCurrent, status);
+          active.delete(part);
+          if (!isCurrent()) return;
+          mergePart(run.all, part);
+          run.doneDays += daysBetween(seg.from, seg.to);
+          onPiece();
+        } catch (err) {
+          active.delete(part);
+          if (!isCurrent()) return;
+          if (err.splittable) {
+            // Smartlead couldn't handle a range this long: make this and every later piece shorter
+            pieceDays = Math.max(1, Math.min(pieceDays, Math.floor(daysBetween(seg.from, seg.to) / 2)));
+            const rebuilt = [
+              ...splitWindow(seg, pieceDays),
+              ...queue.flatMap((s) => (daysBetween(s.from, s.to) > pieceDays ? splitWindow(s, pieceDays) : [s])),
+            ];
+            queue.length = 0;
+            queue.push(...rebuilt);
+            status("Smartlead was slow, loading shorter date ranges");
+            continue;
+          }
+          if (err.status === 400) { fatal = err; return; }
+          run.problems.push({ from: seg.from, to: seg.to, error: err.message });
+          run.doneDays += daysBetween(seg.from, seg.to);
         }
-        if (err.status === 400) throw err;
-        run.problems.push({ from: seg.from, to: seg.to, error: err.message });
-        run.doneDays += daysBetween(seg.from, seg.to);
       }
-      onPiece();
     }
+
+    await Promise.all(Array.from({ length: Math.max(1, Math.min(PARALLEL, queue.length)) }, worker));
+    if (fatal) throw fatal;
   }
 
   function missingText(problems) {
@@ -410,7 +441,7 @@
   }
 
   // ---------- Keep the last result per window in this browser, for instant display ----------
-  const CACHE_PREFIX = "sl-report-v2:";
+  const CACHE_PREFIX = "sl-report-v3:";
   function readCache(win) {
     try { return JSON.parse(localStorage.getItem(CACHE_PREFIX + winKey(win)) || "null"); } catch { return null; }
   }
@@ -498,7 +529,7 @@
       if (!isCurrent()) return clearInterval(timer);
       const secs = Math.round((Date.now() - started) / 1000);
       const lead = cached ? `Showing ${cachedAt} results · updating from Smartlead` : resuming ? "Loading missing days" : "Fetching from Smartlead";
-      setStatus("loading", `${lead}${progressMsg ? ` · ${progressMsg}` : ""} · ${secs}s`);
+      setStatus("loading", `${lead}${progressMsg ? ` · ${progressMsg}` : ""} · ${dur(secs)}`);
     };
     const timer = setInterval(tick, 1000);
     tick();
@@ -523,13 +554,13 @@
       draw(rep);
 
       const at = new Date(rep.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" });
-      const secs = Math.round((Date.now() - started) / 1000);
+      const took = dur(Math.round((Date.now() - started) / 1000));
       if (rep.missing.length) {
-        setStatus("error", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${secs}s) · some days missing`);
+        setStatus("error", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${took}) · some days missing`);
         showNotice(missingText(run.problems), { retry: true, retryLabel: "Load missing days", onRetry: () => load(win, { resume: run }) });
       } else {
         writeCache(rep);
-        setStatus("live", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${secs}s)`);
+        setStatus("live", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${took})`);
       }
     } catch (err) {
       if (!isCurrent()) return;
@@ -940,8 +971,12 @@
   }
 
   // ---------- Setup ----------
-  // Results cached by the old one-day version don't have reply categories
-  try { Object.keys(localStorage).filter((k) => k.startsWith("sl-report:")).forEach((k) => localStorage.removeItem(k)); } catch { /* ignore */ }
+  // Results cached by older versions have different categories
+  try {
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith("sl-report:") || k.startsWith("sl-report-v2:"))
+      .forEach((k) => localStorage.removeItem(k));
+  } catch { /* ignore */ }
 
   $("reply-filter").innerHTML =
     `<option value="all">All replies</option>` +
