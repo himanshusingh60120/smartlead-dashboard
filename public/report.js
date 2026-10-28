@@ -7,6 +7,11 @@
   const PAGE = 50;
   const MAX_RANGE_DAYS = 93; // keep in sync with lib/report.js
 
+  // Long windows are loaded in pieces. Start with a week per piece; if Smartlead struggles,
+  // pieces get smaller (down to one day) and stay that size for the rest of the visit.
+  const START_PIECE_DAYS = 7;
+  let pieceDays = START_PIECE_DAYS;
+
   // Reply categories in display order. Keys must match lib/reply-categories.js.
   const REPLY_GROUPS = [
     { key: "positive", label: "Positive", cats: ["interested", "meeting", "info", "referral"] },
@@ -47,9 +52,12 @@
   };
   const daysBetween = (a, b) => Math.round((Date.parse(`${b}T00:00:00Z`) - Date.parse(`${a}T00:00:00Z`)) / 86400000) + 1;
   const isDate = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s || "");
+  const startIso = (date) => new Date(`${date}T00:00:00.000+05:30`).toISOString();
   const timeIST = (t) => (t ? new Date(t).toLocaleString(undefined, { timeZone: TIME_ZONE, day: "numeric", month: "short", hour: "numeric", minute: "2-digit" }) : "–");
   const longDate = (date) => new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { weekday: "long", day: "numeric", month: "long", year: "numeric" });
   const shortDate = (date) => new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+  const dayMonth = (date) => new Date(`${date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  const pieceLabel = (s) => (s.from === s.to ? dayMonth(s.from) : `${dayMonth(s.from)}–${dayMonth(s.to)}`);
   const pctOf = (n, d) => (n != null && d > 0 ? `${((n / d) * 100).toFixed(1)}%` : "");
 
   let report = null;      // last loaded report for the window on screen, used by the CSV export
@@ -121,6 +129,15 @@
     document.querySelectorAll("[data-preset]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.preset === p)));
   }
 
+  function splitWindow({ from, to }, size) {
+    const out = [];
+    for (let f = from; f <= to; f = addDays(f, size)) {
+      const t = addDays(f, size - 1);
+      out.push({ from: f, to: t < to ? t : to });
+    }
+    return out;
+  }
+
   // ---------- Window totals from daily snapshots ----------
   // Used only for numbers Smartlead doesn't timestamp (opens, clicks, bounces, unsubscribes).
   // A window is only counted when it starts and ends on a snapshot taken around midnight IST.
@@ -155,98 +172,101 @@
     return { totals, isToday };
   }
 
-  // ---------- Live report, fetched from Smartlead in batches ----------
-  // Each batch is its own short request, so none of them hits Vercel's time limit.
-  // If Smartlead is slow the batch size shrinks; if its 10-per-minute limit is hit, we wait and continue.
-  async function fetchLiveReport(win, isCurrent, onProgress) {
-    const TARGET_MS = 10000; // aim for ~10s per Smartlead request
-    const SUMMED = ["leads_with_activity", "sent_in_window", "leads_sent_in_window", "replies_in_window"];
-    let offset = 0;
-    let limit = 100;
-    let failures = 0;
-    let partial = false;
-    const rep = {
-      key: winKey(win), from_date: win.from, to_date: win.to, source: "live", truncated: false,
-      counts: { leads_with_activity: 0, sent_in_window: 0, leads_sent_in_window: 0, replies_in_window: 0, touched_by_step: {}, replies_by_step: {} },
-      replied: [], clicked: [], opened: [],
+  // ---------- Pacing: Smartlead allows 10 lead-activity requests a minute ----------
+  // We stay one under the limit, so normally there's no 60-second penalty to wait out.
+  const RATE = { max: 9, windowMs: 61000 };
+  const recentStarts = [];
+  async function waitForTurn(isCurrent, onWait) {
+    for (;;) {
+      const now = Date.now();
+      while (recentStarts.length && now - recentStarts[0] > RATE.windowMs) recentStarts.shift();
+      if (recentStarts.length < RATE.max) {
+        recentStarts.push(now);
+        return;
+      }
+      if (!isCurrent()) return;
+      const waitMs = RATE.windowMs - (now - recentStarts[0]) + 100;
+      onWait(Math.ceil(waitMs / 1000));
+      await sleep(Math.min(1000, waitMs));
+    }
+  }
+
+  // ---------- Collected data (merged from every piece of the window) ----------
+  const emptyPart = () => ({
+    sums: { leads_with_activity: 0, sent_in_window: 0, replies_in_window: 0 },
+    replies_by_step: {},
+    sentLeads: new Set(),
+    touched: {}, // step -> Set of emails
+    replied: [], clicked: [], opened: [],
+  });
+  const pushAll = (into, rows) => { for (const r of rows || []) into.push(r); };
+
+  function addChunk(p, chunk) {
+    const c = chunk.counts || {};
+    for (const k of Object.keys(p.sums)) p.sums[k] += c[k] || 0;
+    for (const [s, n] of Object.entries(c.replies_by_step || {})) p.replies_by_step[s] = (p.replies_by_step[s] || 0) + n;
+    for (const id of chunk.sent_leads || []) p.sentLeads.add(id);
+    for (const [s, list] of Object.entries(chunk.touched_emails_by_step || {})) {
+      const set = (p.touched[s] ||= new Set());
+      for (const e of list) set.add(e);
+    }
+    pushAll(p.replied, chunk.replied);
+    pushAll(p.clicked, chunk.clicked);
+    pushAll(p.opened, chunk.opened);
+  }
+
+  function mergePart(into, part) {
+    for (const k of Object.keys(into.sums)) into.sums[k] += part.sums[k] || 0;
+    for (const [s, n] of Object.entries(part.replies_by_step)) into.replies_by_step[s] = (into.replies_by_step[s] || 0) + n;
+    part.sentLeads.forEach((id) => into.sentLeads.add(id));
+    for (const [s, set] of Object.entries(part.touched)) {
+      const t = (into.touched[s] ||= new Set());
+      set.forEach((e) => t.add(e));
+    }
+    pushAll(into.replied, part.replied);
+    pushAll(into.clicked, part.clicked);
+    pushAll(into.opened, part.opened);
+  }
+
+  // Turns everything collected so far into one report. The same email can show up in two
+  // pieces (e.g. sent in one, replied to in the next), so rows are de-duplicated.
+  function buildReport(win, all) {
+    const rowKey = (r) => `${r.lead_id}|${r.campaign_id}|${r.seq}|${r.sent_time}`;
+    const dedupe = (rows, pick) => {
+      const m = new Map();
+      for (const r of rows) {
+        const k = rowKey(r);
+        const prev = m.get(k);
+        m.set(k, prev ? pick(prev, r) : r);
+      }
+      return [...m.values()];
+    };
+    const pickRow = (a, b) => (a.sent_in_window || !b.sent_in_window ? a : { ...a, sent_in_window: true });
+    const pickReply = (a, b) => {
+      const later = new Date(b.reply_time) > new Date(a.reply_time) ? b : a;
+      return { ...later, sent_in_window: a.sent_in_window || b.sent_in_window };
     };
 
-    while (isCurrent()) {
-      let chunk;
-      try {
-        chunk = await getJson(`/api/report?from=${win.from}&to=${win.to}&offset=${offset}&limit=${limit}&t=${Date.now()}`);
-        failures = 0;
-      } catch (err) {
-        if (err.status === 429) {
-          for (let s = 60; s > 0 && isCurrent(); s--) {
-            onProgress(rep, `Smartlead allows 10 requests a minute; continuing in ${s}s`);
-            await sleep(1000);
-          }
-          continue;
-        }
-        if (err.status === 504 || err.status === 502 || err.status === 500 || !err.status) {
-          failures++;
-          limit = Math.max(25, Math.floor(limit / 2)); // smaller batch = faster answer
-          if (failures <= 4) {
-            onProgress(rep, "Smartlead is slow, retrying with smaller batches");
-            await sleep(1500 * failures);
-            continue;
-          }
-        }
-        if (offset === 0) throw err;
-        partial = true; // keep what we have
-        break;
-      }
-
-      rep.from = chunk.from;
-      rep.to = chunk.to;
-      for (const k of SUMMED) rep.counts[k] += chunk.counts[k] || 0;
-      for (const k of ["touched_by_step", "replies_by_step"]) {
-        for (const [step, n] of Object.entries(chunk.counts[k] || {})) {
-          rep.counts[k][step] = (rep.counts[k][step] || 0) + n;
-        }
-      }
-      rep.replied.push(...chunk.replied);
-      rep.clicked.push(...chunk.clicked);
-      rep.opened.push(...chunk.opened);
-      offset += chunk.received;
-      finalize(rep);
-      onProgress(rep, `${fmt.format(offset)} leads loaded`);
-
-      // Keep going until Smartlead returns an empty batch; its hasMore flag isn't always right.
-      // When a batch looks like the last one, confirm with one small extra request.
-      if (chunk.received === 0) break;
-      if (chunk.received < limit) {
-        limit = 25;
-        continue;
-      }
-      // Tune the next batch so each request takes ~10s
-      if (chunk.smartlead_ms > 0) {
-        limit = Math.round(Math.min(500, Math.max(25, limit * (TARGET_MS / chunk.smartlead_ms), limit / 2)));
-      }
-    }
-
-    rep.truncated = partial;
-    rep.generated_at = new Date().toISOString();
-    return finalize(rep);
-  }
-
-  // ---------- Keep the last result per window in this browser, for instant display ----------
-  const CACHE_PREFIX = "sl-report-v2:";
-  function readCache(win) {
-    try { return JSON.parse(localStorage.getItem(CACHE_PREFIX + winKey(win)) || "null"); } catch { return null; }
-  }
-  function writeCache(rep) {
-    try {
-      localStorage.setItem(CACHE_PREFIX + rep.key, JSON.stringify(rep));
-    } catch {
-      // Storage full: drop other windows and try once more
-      try {
-        Object.keys(localStorage).filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_PREFIX + rep.key)
-          .forEach((k) => localStorage.removeItem(k));
-        localStorage.setItem(CACHE_PREFIX + rep.key, JSON.stringify(rep));
-      } catch { /* too large to keep; that's fine */ }
-    }
+    return finalize({
+      key: winKey(win),
+      from_date: win.from,
+      to_date: win.to,
+      from: startIso(win.from),
+      to: startIso(addDays(win.to, 1)),
+      source: "live",
+      counts: {
+        leads_with_activity: all.sums.leads_with_activity,
+        sent_in_window: all.sums.sent_in_window,
+        leads_sent_in_window: all.sentLeads.size,
+        replies_in_window: all.sums.replies_in_window,
+        touched_by_step: Object.fromEntries(Object.entries(all.touched).map(([k, v]) => [k, v.size])),
+        replies_by_step: { ...all.replies_by_step },
+      },
+      replied: dedupe(all.replied, pickReply),
+      clicked: dedupe(all.clicked, pickRow),
+      opened: dedupe(all.opened, pickRow),
+      generated_at: new Date().toISOString(),
+    });
   }
 
   function finalize(rep) {
@@ -280,14 +300,143 @@
     return rep;
   }
 
+  // ---------- Live data, fetched from Smartlead ----------
+  // One piece of the window, batch by batch. Each batch is its own short request, so none of
+  // them hits Vercel's time limit. Throws an error with .splittable when a multi-day piece
+  // should be retried as smaller pieces.
+  async function fetchPiece(seg, isCurrent, progress) {
+    const TARGET_MS = 10000; // aim for ~10s per Smartlead request
+    const part = emptyPart();
+    const multiDay = daysBetween(seg.from, seg.to) > 1;
+    let offset = 0;
+    let limit = 100;
+    let failures = 0;
+
+    while (isCurrent()) {
+      await waitForTurn(isCurrent, (s) => progress(`pacing for Smartlead's 10-a-minute limit, next request in ${s}s`, part));
+      if (!isCurrent()) break;
+
+      let chunk;
+      try {
+        chunk = await getJson(`/api/report?from=${seg.from}&to=${seg.to}&offset=${offset}&limit=${limit}&t=${Date.now()}`);
+        failures = 0;
+      } catch (err) {
+        if (err.status === 429) {
+          for (let s = 60; s > 0 && isCurrent(); s--) {
+            progress(`Smartlead's rate limit was hit, continuing in ${s}s`, part);
+            await sleep(1000);
+          }
+          continue;
+        }
+        if (err.status === 400) throw err; // the request itself is wrong; retrying won't help
+        if (multiDay) {
+          const e = new Error(err.message);
+          e.splittable = true;
+          throw e;
+        }
+        failures++;
+        if (failures <= 4) {
+          limit = Math.max(25, Math.floor(limit / 2)); // smaller batch = faster answer
+          progress("Smartlead is slow, retrying with smaller batches", part);
+          await sleep(1500 * failures);
+          continue;
+        }
+        throw err;
+      }
+
+      addChunk(part, chunk);
+      offset += chunk.received;
+      progress("", part);
+
+      // Keep going until Smartlead returns an empty batch; its hasMore flag isn't always right.
+      // When a batch looks like the last one, confirm with one small extra request.
+      if (chunk.received === 0) break;
+      if (chunk.received < limit) {
+        limit = 25;
+        continue;
+      }
+      // Tune the next batch so each request takes ~10s
+      if (chunk.smartlead_ms > 0) {
+        limit = Math.round(Math.min(500, Math.max(25, limit * (TARGET_MS / chunk.smartlead_ms), limit / 2)));
+      }
+    }
+    return part;
+  }
+
+  // Works through the queue of pieces. Pieces that can't be loaded at all are recorded in
+  // run.problems (the rest of the window still loads) so they can be retried on their own.
+  async function runPieces(run, queue, isCurrent, onProgress, onPiece) {
+    const totalDays = daysBetween(run.win.from, run.win.to);
+    while (queue.length && isCurrent()) {
+      const seg = queue.shift();
+      const progress = (msg, part) => {
+        const leads = run.all.sums.leads_with_activity + (part ? part.sums.leads_with_activity : 0);
+        const where = totalDays > 1 ? `${pieceLabel(seg)} · ${fmt.format(run.doneDays)} of ${fmt.format(totalDays)} days done · ` : "";
+        onProgress(`${where}${fmt.format(leads)} leads loaded${msg ? ` · ${msg}` : ""}`);
+      };
+      try {
+        const part = await fetchPiece(seg, isCurrent, progress);
+        if (!isCurrent()) return;
+        mergePart(run.all, part);
+        run.doneDays += daysBetween(seg.from, seg.to);
+      } catch (err) {
+        if (!isCurrent()) return;
+        if (err.splittable) {
+          // Smartlead couldn't handle a piece this long: make this and every later piece smaller
+          pieceDays = Math.max(1, Math.min(pieceDays, Math.floor(daysBetween(seg.from, seg.to) / 2)));
+          const rebuilt = [
+            ...splitWindow(seg, pieceDays),
+            ...queue.flatMap((s) => (daysBetween(s.from, s.to) > pieceDays ? splitWindow(s, pieceDays) : [s])),
+          ];
+          queue.length = 0;
+          queue.push(...rebuilt);
+          progress("Smartlead was slow, loading in smaller pieces", null);
+          continue;
+        }
+        if (err.status === 400) throw err;
+        run.problems.push({ from: seg.from, to: seg.to, error: err.message });
+        run.doneDays += daysBetween(seg.from, seg.to);
+      }
+      onPiece();
+    }
+  }
+
+  function missingText(problems) {
+    const labels = problems.map(pieceLabel);
+    const list = labels.length > 4 ? `${labels.slice(0, 4).join(", ")} and ${labels.length - 4} more` : labels.join(", ");
+    const days = problems.reduce((n, p) => n + daysBetween(p.from, p.to), 0);
+    const why = problems[0]?.error ? ` (${problems[0].error.replace(/\.$/, "")})` : "";
+    return `Couldn't load ${list} from Smartlead${why}. The numbers below leave out ${days === 1 ? "that day" : `those ${days} days`}.`;
+  }
+
+  // ---------- Keep the last result per window in this browser, for instant display ----------
+  const CACHE_PREFIX = "sl-report-v2:";
+  function readCache(win) {
+    try { return JSON.parse(localStorage.getItem(CACHE_PREFIX + winKey(win)) || "null"); } catch { return null; }
+  }
+  function writeCache(rep) {
+    try {
+      localStorage.setItem(CACHE_PREFIX + rep.key, JSON.stringify(rep));
+    } catch {
+      // Storage full: drop other windows and try once more
+      try {
+        Object.keys(localStorage).filter((k) => k.startsWith(CACHE_PREFIX) && k !== CACHE_PREFIX + rep.key)
+          .forEach((k) => localStorage.removeItem(k));
+        localStorage.setItem(CACHE_PREFIX + rep.key, JSON.stringify(rep));
+      } catch { /* too large to keep; that's fine */ }
+    }
+  }
+
   // ---------- Loading ----------
-  async function load(input) {
+  // resume: a previous run of the same window; only its missing pieces are fetched again.
+  async function load(input, { resume = null } = {}) {
     const { from, to, clipped } = clampWindow(input.from, input.to);
     const win = { from, to };
     current = win;
     const id = ++requestId;
     const isCurrent = () => id === requestId;
     const started = Date.now();
+    const resuming = Boolean(resume) && winKey(resume.win) === winKey(win);
 
     $("from").value = from;
     $("to").value = to;
@@ -314,12 +463,15 @@
     sumP.then((v) => { sum = v; if (isCurrent() && drawn) draw(drawn); });
 
     // Show the last result for this window straight away, if we have one
-    const cached = readCache(win);
+    const cached = resuming ? null : readCache(win);
     const cachedAt = cached ? new Date(cached.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" }) : null;
-    report = cached || null;
-    if (cached) {
+    if (resuming && report) {
+      draw(report);
+    } else if (cached) {
+      report = cached;
       draw(cached);
     } else {
+      report = null;
       shown = null;
       renderSummary(null, null, win, { loading: true });
       renderReplyBreakdown(null, { loading: true });
@@ -329,38 +481,63 @@
       }
     }
 
+    // What to fetch: the whole window in pieces, or only the pieces that failed last time
+    const run = resuming ? resume : { win, all: emptyPart(), problems: [], doneDays: 0 };
+    let queue;
+    if (resuming) {
+      queue = run.problems.map((p) => ({ from: p.from, to: p.to }));
+      run.doneDays -= queue.reduce((n, s) => n + daysBetween(s.from, s.to), 0);
+      run.problems = [];
+    } else {
+      queue = splitWindow(win, pieceDays);
+    }
+
     // Status line with a running timer
     let progressMsg = "";
     const tick = () => {
       if (!isCurrent()) return clearInterval(timer);
       const secs = Math.round((Date.now() - started) / 1000);
-      const lead = cached ? `Showing ${cachedAt} results · updating from Smartlead` : "Fetching from Smartlead";
+      const lead = cached ? `Showing ${cachedAt} results · updating from Smartlead` : resuming ? "Loading missing days" : "Fetching from Smartlead";
       setStatus("loading", `${lead}${progressMsg ? ` · ${progressMsg}` : ""} · ${secs}s`);
     };
     const timer = setInterval(tick, 1000);
     tick();
 
     try {
-      const rep = await fetchLiveReport(win, isCurrent, (partialRep, msg) => {
-        if (!isCurrent()) return;
-        progressMsg = msg;
-        tick();
-        // Without a cached copy, show results as they arrive
-        if (!cached && partialRep.counts.leads_with_activity) draw(partialRep);
-      });
+      await runPieces(
+        run, queue, isCurrent,
+        (msg) => { progressMsg = msg; tick(); },
+        // Without a cached copy, show results as each piece arrives
+        () => { if (isCurrent() && !cached) draw(buildReport(win, run.all)); },
+      );
       if (!isCurrent()) return;
+
+      const totalDays = daysBetween(from, to);
+      const missingDays = run.problems.reduce((n, p) => n + daysBetween(p.from, p.to), 0);
+      if (missingDays >= totalDays) throw new Error(run.problems[0]?.error || "Smartlead didn't return any data.");
+
       sum = await sumP;
+      const rep = buildReport(win, run.all);
+      rep.missing = run.problems.map((p) => ({ from: p.from, to: p.to }));
       report = rep;
       draw(rep);
-      if (!rep.truncated) writeCache(rep);
+
       const at = new Date(rep.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" });
       const secs = Math.round((Date.now() - started) / 1000);
-      setStatus("live", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${secs}s)`);
-      if (rep.truncated) showNotice("Smartlead stopped responding part-way, so the lists may be incomplete.", { retry: true });
+      if (rep.missing.length) {
+        setStatus("error", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${secs}s) · some days missing`);
+        showNotice(missingText(run.problems), { retry: true, retryLabel: "Load missing days", onRetry: () => load(win, { resume: run }) });
+      } else {
+        writeCache(rep);
+        setStatus("live", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${secs}s)`);
+      }
     } catch (err) {
       if (!isCurrent()) return;
       const why = err.status === 504 || err.status === 502 ? "Smartlead isn't responding right now." : err.message;
-      if (cached) {
+      if (resuming && report) {
+        setStatus("error", `${windowLabel(win)} · some days missing`);
+        showNotice(`Couldn't load the missing days: ${why}`, { retry: true, retryLabel: "Try again", onRetry: () => load(win, { resume: run }) });
+      } else if (cached) {
         setStatus("error", `${windowLabel(win)} · showing results from ${cachedAt}`);
         showNotice(`Couldn't update from Smartlead: ${why}`, { retry: true });
       } else {
@@ -378,7 +555,7 @@
     }
   }
 
-  function showNotice(text, { retry = false, retryLabel = "Try again" } = {}) {
+  function showNotice(text, { retry = false, retryLabel = "Try again", onRetry = () => load(current) } = {}) {
     const el = $("notice");
     el.textContent = text;
     if (retry) {
@@ -387,7 +564,7 @@
       btn.className = "link-btn";
       btn.style.marginLeft = "0.5rem";
       btn.textContent = retryLabel;
-      btn.addEventListener("click", () => load(current));
+      btn.addEventListener("click", onRetry);
       el.append(btn);
     }
     el.hidden = false;
@@ -700,6 +877,7 @@
     const ofReplied = (n) => (total ? `${pctOf(n, total)} of leads who replied` : "");
     const sum = lastSummary || { sent: c.sent_in_window, steps: stepBreakdown(report, null) };
     const stepLine = (label, r) => line([label, r.touched, r.opened, r.clicked, r.replies, r.bounced, r.unsubscribed]);
+    const missing = report.missing || [];
 
     const out = [
       line(["Smartlead report"]),
@@ -707,6 +885,7 @@
       line(["From (IST)", ist(report.from)]),
       line(["To (IST)", ist(report.to)]),
       line(["Days", daysBetween(win.from, win.to)]),
+      ...(missing.length ? [line(["Days not loaded", missing.map(pieceLabel).join(", ")])] : []),
       line(["Exported at (IST)", ist(new Date().toISOString())]),
       "",
       line(["Metric", "Value", "Note"]),
