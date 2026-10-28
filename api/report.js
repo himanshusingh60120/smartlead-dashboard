@@ -3,7 +3,7 @@
 // Returns ONE batch of lead activity for the window (IST days, both ends included), live from Smartlead.
 // ?date=YYYY-MM-DD still works and means a one-day window.
 // The Report page calls this repeatedly (offset += received) until a batch comes back empty,
-// so no single request comes near Vercel's time limit.
+// and splits long windows into pieces, so no single request comes near Vercel's time limit.
 import { fetchReportChunk, todayIST, addDays, daysBetween, MAX_RANGE_DAYS } from "../lib/report.js";
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
