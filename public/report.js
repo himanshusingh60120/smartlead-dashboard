@@ -6,11 +6,14 @@
   const TIME_ZONE = "Asia/Kolkata";
   const PAGE = 50;
   const MAX_RANGE_DAYS = 93; // keep in sync with lib/report.js
+  // A snapshot taken at or after this hour (IST) doesn't mark the start of its day
+  const LATE_HOUR = 1;
 
   // ---------- Loading speed ----------
-  // Smartlead allows only 10 requests a minute here, so each request should carry as many leads
-  // as possible (up to 1,000). Batches aim for ~30s each and only shrink when a request fails.
-  // Long windows are split into pieces of a few days, loaded 3 at a time.
+  // Past days saved by the nightly job (public/data/reports/) load instantly.
+  // Anything else comes live from Smartlead, which allows only 10 requests a minute here, so each
+  // request should carry as many leads as possible (up to 1,000). Batches aim for ~30s each and
+  // only shrink when a request fails. Long windows are split into pieces of a few days, loaded 3 at a time.
   const BATCH = { min: 50, max: 1000, target: 30000 };
   let batchLimit = 500;
   const START_PIECE_DAYS = 3;
@@ -72,11 +75,11 @@
     return `${Math.floor(secs / 3600)} h ${Math.round((secs % 3600) / 60)} min`;
   };
 
-  let report = null;      // last loaded report for the window on screen, used by the CSV export
-  let shown = null;       // report currently drawn (may still be loading)
+  let report = null; // last loaded report for the window on screen, used by the CSV export
+  let shown = null; // report currently drawn (may still be loading)
   let lastSummary = null; // { sent, steps } used by the CSV export
   let requestId = 0;
-  let current = null;     // { from, to }
+  let current = null; // { from, to }
   let replyFilter = "all";
 
   async function getJson(url) {
@@ -100,7 +103,7 @@
   const PRESETS = {
     today: () => ({ from: today(), to: today() }),
     yesterday: () => { const y = addDays(today(), -1); return { from: y, to: y }; },
-    "7": () => ({ from: addDays(today(), -7), to: addDays(today(), -1) }),   // 7 full days, ending yesterday
+    "7": () => ({ from: addDays(today(), -7), to: addDays(today(), -1) }), // 7 full days, ending yesterday
     "30": () => ({ from: addDays(today(), -30), to: addDays(today(), -1) }), // 30 full days, ending yesterday
     month: () => ({ from: `${today().slice(0, 8)}01`, to: today() }),
   };
@@ -150,17 +153,32 @@
     return out;
   }
 
+  // The parts of a window not covered by the given set of days, as contiguous ranges
+  function missingRanges(win, have) {
+    const out = [];
+    let start = null;
+    for (let d = win.from; d <= win.to; d = addDays(d, 1)) {
+      if (have.has(d)) {
+        if (start) { out.push({ from: start, to: addDays(d, -1) }); start = null; }
+      } else if (!start) {
+        start = d;
+      }
+    }
+    if (start) out.push({ from: start, to: win.to });
+    return out;
+  }
+
   // ---------- Window totals from daily snapshots ----------
   // Used only for numbers Smartlead doesn't timestamp (opens, clicks, bounces, unsubscribes).
-  // A window is only counted when it starts and ends on a snapshot taken around midnight IST.
+  // A window is only counted when it starts and ends on a snapshot taken just after midnight IST.
   const hourIST = (t) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: TIME_ZONE, hour: "2-digit", hourCycle: "h23" }).format(new Date(t)));
 
   async function rangeTotals({ from, to }) {
     const hist = await getJson(`/data/history.json?t=${Date.now()}`).catch(() => ({ snapshots: [] }));
     const list = [...(hist.snapshots || [])].sort((a, b) => a.date.localeCompare(b.date));
     const snaps = Object.fromEntries(list.map((s) => [s.date, s]));
-    // Older snapshots have no taken_at: the very first one was a manual daytime run, the rest ran at midnight.
-    const atMidnight = (snap) => Boolean(snap) && (snap.taken_at ? hourIST(snap.taken_at) < 4 : snap !== list[0]);
+    // Older snapshots have no taken_at: the very first one was a manual daytime run.
+    const atMidnight = (snap) => Boolean(snap) && (snap.taken_at ? hourIST(snap.taken_at) < LATE_HOUR : snap !== list[0]);
 
     const start = snaps[from];
     if (!atMidnight(start)) return null;
@@ -238,6 +256,26 @@
     pushAll(into.replied, part.replied);
     pushAll(into.clicked, part.clicked);
     pushAll(into.opened, part.opened);
+  }
+
+  // ---------- Saved days (written each night by scripts/build-reports.mjs) ----------
+  // Loads every day of the window that has a saved file into run.all. Returns the set of days loaded.
+  async function loadSavedDays(win, run, isCurrent) {
+    const index = await getJson(`/data/reports/index.json?t=${Date.now()}`).catch(() => null);
+    const available = new Set(index?.dates || []);
+    const t = today();
+    const days = [];
+    for (let d = win.from; d <= win.to; d = addDays(d, 1)) if (available.has(d) && d !== t) days.push(d);
+
+    const loaded = new Set();
+    await Promise.all(days.map(async (d) => {
+      const file = await getJson(`/data/reports/${d}.json`).catch(() => null);
+      if (!file || !isCurrent()) return;
+      addChunk(run.all, file);
+      loaded.add(d);
+    }));
+    run.doneDays += loaded.size;
+    return loaded;
   }
 
   // Turns everything collected so far into one report. The same email can show up in two
@@ -507,20 +545,26 @@
       renderSummary(null, null, win, { loading: true });
       renderReplyBreakdown(null, { loading: true });
       for (const k of ["replied", "clicked", "opened"]) {
-        $(`${k}-list`).innerHTML = `<p class="empty">Loading from Smartlead…</p>`;
+        $(`${k}-list`).innerHTML = `<p class="empty">Loading…</p>`;
         $(`${k}-count`).textContent = "";
       }
     }
 
-    // What to fetch: the whole window in pieces, or only the pieces that failed last time
+    // What to fetch: saved days instantly, the rest of the window live in pieces,
+    // or (when resuming) only the pieces that failed last time
     const run = resuming ? resume : { win, all: emptyPart(), problems: [], doneDays: 0 };
     let queue;
+    let savedCount = 0;
     if (resuming) {
       queue = run.problems.map((p) => ({ from: p.from, to: p.to }));
       run.doneDays -= queue.reduce((n, s) => n + daysBetween(s.from, s.to), 0);
       run.problems = [];
     } else {
-      queue = splitWindow(win, pieceDays);
+      const saved = await loadSavedDays(win, run, isCurrent);
+      if (!isCurrent()) return;
+      savedCount = saved.size;
+      if (savedCount && !cached) draw(buildReport(win, run.all));
+      queue = missingRanges(win, saved).flatMap((r) => splitWindow(r, pieceDays));
     }
 
     // Status line with a running timer
@@ -555,12 +599,17 @@
 
       const at = new Date(rep.generated_at).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" });
       const took = dur(Math.round((Date.now() - started) / 1000));
+      const source = savedCount >= totalDays
+        ? "from saved reports"
+        : savedCount
+          ? `${savedCount} saved day${savedCount === 1 ? "" : "s"} + live from Smartlead`
+          : "live from Smartlead";
       if (rep.missing.length) {
-        setStatus("error", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${took}) · some days missing`);
+        setStatus("error", `${windowLabel(win)} · ${source} at ${at} IST (took ${took}) · some days missing`);
         showNotice(missingText(run.problems), { retry: true, retryLabel: "Load missing days", onRetry: () => load(win, { resume: run }) });
       } else {
         writeCache(rep);
-        setStatus("live", `${windowLabel(win)} · live from Smartlead at ${at} IST (took ${took})`);
+        setStatus("live", `${windowLabel(win)} · ${source} at ${at} IST (took ${took})`);
       }
     } catch (err) {
       if (!isCurrent()) return;
@@ -627,18 +676,23 @@
     const replies = c?.replies_in_window ?? c?.replied;
     const g = c?.reply_groups;
     const repliedLeads = c?.replied;
-    // Opens/clicks: midnight-to-midnight snapshots when available, otherwise leads in the lists below
-    const opened = t ? t.unique_opened : c?.opened;
-    const clicked = t ? t.clicked : c?.clicked;
 
     const steps = stepBreakdown(rep, t);
     lastSummary = { sent, steps };
 
+    // Opens/clicks: with on-time midnight snapshots, all activity in the window (no rate, since
+    // first-time openers and newly contacted leads are different groups). Otherwise, opens on
+    // emails sent in this window, as a share of the leads those emails went to.
+    const openedItem = t
+      ? item("New openers", t.unique_opened, "leads opening for the first time")
+      : item("Leads opened", c?.opened, pctOf(c?.opened, leads));
+    const clickedItem = t ? item("Clicks", t.clicked) : item("Leads clicked", c?.clicked);
+
     $("summary").innerHTML =
       item("Emails sent", sent, leads != null ? `${fmt.format(leads)} leads` : "") +
-      item(t ? "Opened" : "Leads opened", opened, pctOf(opened, t ? t.unique_sent : leads)) +
-      item(t ? "Clicked" : "Leads clicked", clicked) +
-      item("Replies", replies, pctOf(replies, leads)) +
+      openedItem +
+      clickedItem +
+      item("Replies", replies, repliedLeads != null ? `from ${fmt.format(repliedLeads)} lead${repliedLeads === 1 ? "" : "s"}` : "") +
       item("Positive replies", g ? g.positive : null, g ? pctOf(g.positive, repliedLeads) : "") +
       item("Negative replies", g ? g.negative : null, g ? pctOf(g.negative, repliedLeads) : "") +
       item("Bounced", t ? t.bounced : null, t ? pctOf(t.bounced, t.sent) : "") +
@@ -648,7 +702,11 @@
 
     const notes = [`Counted from ${span}${win.to === today() ? " (today is still in progress)" : ""}.`];
     if (g) notes.push("Positive and negative count each lead who replied once, by their latest reply; percentages are of leads who replied.");
-    if (!t) notes.push("Opens and clicks are counted from the lead lists below, and bounces aren't available, because this window doesn't start and end on midnight snapshots.");
+    if (t) {
+      notes.push("New openers and clicks above are all activity in this window; the lead lists and step table below only cover emails sent in this window.");
+    } else {
+      notes.push("Opens and clicks are counted on emails sent in this window (Smartlead doesn't timestamp opens), and bounces aren't available, because this window doesn't start and end on on-time midnight snapshots.");
+    }
     $("summary-note").textContent = notes.join(" ");
   }
 
@@ -740,6 +798,7 @@
 
   // ---------- Per-step breakdown (E1, E2, …) ----------
   // E1–E4 are always shown; later steps (E5, E6, …) appear when there's something to show for them.
+  // Opens per step only count emails sent in this window, so the open rate compares like with like.
   function stepBreakdown(rep, t) {
     const c = rep?.counts;
     const uniqBy = (rows) => {
@@ -825,7 +884,11 @@
     $(`${kind}-count`).textContent = count ?? (rows.length ? `(${fmt.format(new Set(rows.map((r) => r.lead_id)).size)})` : "");
     const el = $(`${kind}-list`);
     if (!rows.length) {
-      el.innerHTML = `<p class="empty">${esc(empty || { replied: "No replies in this window.", clicked: "No clicks in this window.", opened: "No opens in this window." }[kind])}</p>`;
+      el.innerHTML = `<p class="empty">${esc(empty || {
+        replied: "No replies in this window.",
+        clicked: "No clicks on emails sent in this window.",
+        opened: "No opens on emails sent in this window.",
+      }[kind])}</p>`;
       return;
     }
     const draw = (n) => {
@@ -934,7 +997,7 @@
         ...(g.key === "review" ? [] : g.cats.map((k) => line([g.label, CAT_LABELS[k], cats[k] || 0, pctOf(cats[k] || 0, total)]))),
       ]),
       "",
-      line(["", "Total Count", "Leads opened", "Leads clicked", "Replies", "Bounced", "Unsubscribed"]),
+      line(["", "Total Count", "Leads opened (emails sent in window)", "Leads clicked (emails sent in window)", "Replies", "Bounced", "Unsubscribed"]),
       stepLine("Unique emails touched", sum.steps.total),
       ...sum.steps.rows.map((r) => stepLine(`Unique emails touched · ${r.label}`, r)),
       "",
@@ -971,10 +1034,10 @@
   }
 
   // ---------- Setup ----------
-  // Results cached by older versions have different categories
+  // Results cached by older versions have different categories or opens counted differently
   try {
     Object.keys(localStorage)
-      .filter((k) => k.startsWith("sl-report:") || k.startsWith("sl-report-v2:"))
+      .filter((k) => k.startsWith("sl-report:") || k.startsWith("sl-report-v2:") || k.startsWith("sl-report-v3:"))
       .forEach((k) => localStorage.removeItem(k));
   } catch { /* ignore */ }
 
