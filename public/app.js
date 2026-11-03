@@ -4,12 +4,16 @@
 
   const METRICS = ["sent", "unique_sent", "unique_opened", "clicked", "replied", "bounced", "unsubscribed"];
   const AUTO_REFRESH_MS = 5 * 60 * 1000;
+  const TIME_ZONE = "Asia/Kolkata";
+  // A snapshot taken at or after this hour (IST) doesn't mark the start of its day:
+  // the days on either side of it include or miss part of that morning.
+  const LATE_HOUR = 1;
 
   const state = { range: "all", granularity: "day", sortKey: "sent", sortDir: "desc", search: "", status: "" };
-  let data = null;      // { updated_at, live, campaigns, error? }
-  let snapshots = [];   // daily snapshots from history.json (totals at the start of each day)
-  let deltas = [];      // [{ date, campaigns: { id: { metric: n } } }]
-  let baseline = null;  // last nightly copy (latest.json), used to show leads added since then
+  let data = null; // { updated_at, live, campaigns, error?, pending? }
+  let snapshots = []; // daily snapshots from history.json (totals at the start of each day)
+  let deltas = []; // [{ date, late, startAt, endAt, campaigns: { id: { metric: n } } }]
+  let baseline = null; // last nightly copy (latest.json), shown first and used to show leads added since then
   let chart = null;
   let loading = false;
   let timer = null;
@@ -21,6 +25,9 @@
   const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
   const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
   const titleCase = (s) => String(s || "").toLowerCase().replace(/(^|\s|_)\w/g, (m) => m.toUpperCase()).replace(/_/g, " ");
+  const fmtWhen = (t) => (t ? new Date(t).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "never");
+  const hourIST = (t) => Number(new Intl.DateTimeFormat("en-GB", { timeZone: TIME_ZONE, hour: "2-digit", hourCycle: "h23" }).format(new Date(t)));
+  const timeIST = (t) => new Date(t).toLocaleTimeString(undefined, { timeZone: TIME_ZONE, hour: "numeric", minute: "2-digit" });
 
   // ---------- Loading ----------
 
@@ -34,21 +41,37 @@
   async function load({ fresh = false } = {}) {
     if (loading) return;
     loading = true;
-    setStatus("loading", data ? "Refreshing…" : "Loading live data…");
     $("refresh").disabled = true;
+    const firstLoad = !data;
+    setStatus("loading", firstLoad ? "Loading…" : "Refreshing…");
 
     const historyP = getJson(`/data/history.json?t=${Date.now()}`).catch(() => ({ snapshots: [] }));
     const savedP = getJson(`/data/latest.json?t=${Date.now()}`).catch(() => null);
+    // Vercel keeps /api/stats for 2 minutes, so reloads and other viewers share one Smartlead fetch.
+    // The Refresh button adds a unique query to skip that and ask Smartlead directly.
+    const liveP = getJson(fresh ? `/api/stats?fresh=${Date.now()}` : "/api/stats");
+    liveP.catch(() => {}); // handled below
+
+    snapshots = ((await historyP).snapshots || []).sort((a, b) => a.date.localeCompare(b.date));
+    baseline = await savedP;
+
+    // First visit: show last night's copy straight away, then swap in the live numbers
+    if (firstLoad && baseline) {
+      data = { ...baseline, live: false, pending: true };
+      deltas = buildDeltas(snapshots, null, data.campaigns);
+      updateNotice();
+      updateControls();
+      render();
+      setStatus("loading", `Showing saved data from ${fmtWhen(baseline.updated_at)} · loading live numbers…`);
+    }
+
     try {
-      const live = await getJson(`/api/stats?fresh=${Date.now()}`);
+      const live = await liveP;
       data = { ...live, live: true };
     } catch (err) {
       // Live API unavailable: fall back to the last nightly copy.
-      const saved = await savedP;
-      data = saved ? { ...saved, live: false, error: err.message } : { campaigns: [], live: false, error: err.message };
+      data = baseline ? { ...baseline, live: false, error: err.message } : { campaigns: [], live: false, error: err.message };
     }
-    baseline = await savedP;
-    snapshots = ((await historyP).snapshots || []).sort((a, b) => a.date.localeCompare(b.date));
     deltas = buildDeltas(snapshots, data.live ? data.campaigns : null, data.campaigns);
 
     loading = false;
@@ -65,8 +88,7 @@
   }
 
   function updateStatus() {
-    const when = data.updated_at ? new Date(data.updated_at) : null;
-    const time = when ? when.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }) : "never";
+    const time = fmtWhen(data.updated_at);
     if (data.live) {
       setStatus("live", `Live · updated ${time}`);
     } else {
@@ -87,8 +109,26 @@
       const first = new Date(`${snapshots[0].date}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
       notes.push(`Daily history starts ${first}, so longer periods only cover days since then.`);
     }
+    const late = deltas.filter((d) => d.late).length;
+    if (late) {
+      notes.push(`${late} of ${deltas.length} days have shifted boundaries because the nightly snapshot ran late, so those days include or miss part of a morning. Hover a day in the chart to check.`);
+    }
     $("notice").textContent = notes.join(" ");
     $("notice").hidden = notes.length === 0;
+  }
+
+  // Is this snapshot a true "start of day"? Older snapshots have no time: the first was a daytime manual run.
+  function onTime(snap, isFirst) {
+    if (!snap) return false;
+    if (snap.taken_at) return hourIST(snap.taken_at) < LATE_HOUR;
+    return !isFirst;
+  }
+
+  function lateText(day) {
+    const parts = [];
+    if (day.startAt && hourIST(day.startAt) >= LATE_HOUR) parts.push(`starts ${timeIST(day.startAt)}`);
+    if (day.endAt && hourIST(day.endAt) >= LATE_HOUR) parts.push(`ends ${timeIST(day.endAt)} next day`);
+    return parts.length ? `Day boundary off: ${parts.join(", ")}` : "Day boundary off (partial first day)";
   }
 
   /**
@@ -96,6 +136,7 @@
    * Activity on day D = snapshot(D+1) − snapshot(D), or live − snapshot(D) for today.
    * Campaigns created on the day history starts also get everything they did
    * before that first snapshot, so day one isn't undercounted.
+   * Days whose start or end snapshot wasn't taken around midnight are marked late.
    */
   function buildDeltas(snaps, liveCampaigns, allCampaigns) {
     const points = [...snaps];
@@ -107,7 +148,15 @@
     for (let i = 0; i < points.length; i++) {
       const cur = points[i];
       if (i > 0) {
-        const day = { date: points[i - 1].date, campaigns: {} };
+        const start = points[i - 1];
+        const endIsSnapshot = cur.date != null;
+        const day = {
+          date: start.date,
+          campaigns: {},
+          late: !onTime(start, i - 1 === 0) || (endIsSnapshot && !onTime(cur, false)),
+          startAt: start.taken_at || null,
+          endAt: endIsSnapshot ? cur.taken_at || null : null,
+        };
         for (const [id, c] of Object.entries(cur.campaigns)) {
           const prev = lastSeen[id];
           const d = {};
@@ -124,7 +173,7 @@
     if (first) {
       const created = Object.fromEntries((allCampaigns || []).map((c) => [String(c.id), localDate(c.created_at)]));
       let day = out.find((d) => d.date === first.date);
-      if (!day) { day = { date: first.date, campaigns: {} }; out.unshift(day); }
+      if (!day) { day = { date: first.date, campaigns: {}, late: true, startAt: first.taken_at || null, endAt: null }; out.unshift(day); }
       for (const [id, c] of Object.entries(first.campaigns)) {
         if (!created[id] || created[id] < first.date) continue;
         const d = (day.campaigns[id] ||= Object.fromEntries(METRICS.map((m) => [m, 0])));
@@ -140,7 +189,7 @@
     if (!ts) return null;
     const d = new Date(ts);
     if (Number.isNaN(d.getTime())) return String(ts).slice(0, 10);
-    return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata" }).format(d);
+    return new Intl.DateTimeFormat("en-CA", { timeZone: TIME_ZONE }).format(d);
   }
 
   // ---------- One-time setup ----------
@@ -219,11 +268,29 @@
     return deltas.filter((d) => d.date >= cut);
   }
 
+  /**
+   * All time: rates are per lead contacted (unique opens ÷ leads contacted, replies ÷ leads contacted).
+   * A period only knows first-time openers and newly contacted leads, so a period open rate would
+   * compare different groups of leads. For a period, open rate isn't shown and the other rates are
+   * per email sent in that period.
+   */
+  function withRates(r, period) {
+    return {
+      ...r,
+      open_rate: period || r.plain_text ? null : pct(r.unique_opened, r.unique_sent),
+      reply_rate: period ? pct(r.replied, r.sent) : pct(r.replied, r.unique_sent),
+      click_rate: period ? pct(r.clicked, r.sent) : pct(r.clicked, r.unique_sent),
+      unsub_rate: period ? pct(r.unsubscribed, r.sent) : pct(r.unsubscribed, r.unique_sent),
+      bounce_rate: pct(r.bounced, r.sent),
+    };
+  }
+
   function currentRows() {
     const campaigns = data.campaigns || [];
     const byId = Object.fromEntries(campaigns.map((c) => [String(c.id), c]));
+    const period = state.range !== "all";
     let rows;
-    if (state.range === "all") {
+    if (!period) {
       rows = campaigns.map((c) => ({ ...c }));
     } else {
       const sums = {};
@@ -244,12 +311,7 @@
         }));
     }
     if (state.status) rows = rows.filter((r) => r.status === state.status);
-    return rows.map((r) => ({
-      ...r,
-      open_rate: r.plain_text ? null : pct(r.unique_opened, r.unique_sent),
-      reply_rate: pct(r.replied, r.unique_sent),
-      bounce_rate: pct(r.bounced, r.sent),
-    }));
+    return rows.map((r) => withRates(r, period));
   }
 
   function totals(rows) {
@@ -262,14 +324,27 @@
 
   function render() {
     const rows = currentRows();
+    updateHeaderHints();
     renderFunnel(rows);
     renderChart();
     renderTable(rows);
   }
 
+  function updateHeaderHints() {
+    const period = state.range !== "all";
+    const set = (key, text) => {
+      const th = document.querySelector(`thead th[data-key="${key}"]`);
+      if (th) th.title = text;
+    };
+    set("open_rate", period ? "Not shown for a period: it would compare different groups of leads" : "Unique opens ÷ leads contacted");
+    set("reply_rate", period ? "Replies ÷ emails sent in this period" : "Replies ÷ leads contacted");
+    set("bounce_rate", "Bounces ÷ emails sent");
+  }
+
   function renderFunnel(rows) {
     const t = totals(rows);
-    const base = t.unique_sent || t.sent || 0;
+    const period = state.range !== "all";
+    const base = period ? t.sent : t.unique_sent; // what rates are divided by
 
     // Total leads = the same campaigns as the table below, so the numbers always add up.
     const leadsTotal = rows.reduce((a, r) => a + (r.leads_total || 0), 0);
@@ -279,7 +354,7 @@
     const shownIds = new Set(rows.map((r) => String(r.id)));
     const hidden = (data.campaigns || []).filter((c) => !shownIds.has(String(c.id)) && (!state.status || c.status === state.status));
     const leadsHidden = hidden.reduce((a, c) => a + (c.leads_total || 0), 0);
-    const scale = leadsTotal || base; // bars are drawn relative to total leads
+    const scale = leadsTotal || t.unique_sent || t.sent; // bars are drawn relative to total leads
 
     // Leads added (net) across ALL campaigns since the last nightly snapshot, so new uploads
     // show up right away even when they go into a paused, drafted or brand-new campaign.
@@ -288,8 +363,7 @@
       const before = Object.fromEntries(baseline.campaigns.map((c) => [String(c.id), c.leads_total || 0]));
       const scope = (data.campaigns || []).filter((c) => !state.status || c.status === state.status);
       const change = scope.reduce((a, c) => a + (c.leads_total || 0) - (before[String(c.id)] || 0), 0);
-      const since = new Date(baseline.updated_at).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
-      addedNote = `${change >= 0 ? "+" : "−"}${fmt.format(Math.abs(change))} lead${Math.abs(change) === 1 ? "" : "s"} added since the nightly snapshot (${since})`;
+      addedNote = `${change >= 0 ? "+" : "−"}${fmt.format(Math.abs(change))} lead${Math.abs(change) === 1 ? "" : "s"} added since the nightly snapshot (${fmtWhen(baseline.updated_at)})`;
     }
 
     const stages = [
@@ -300,10 +374,17 @@
           addedNote,
         ].filter(Boolean).join("<br>") },
       { label: "Emails sent", value: t.sent, color: "--sent",
-        note: `${fmt.format(t.unique_sent)} leads contacted${leadsTotal ? ` · ${fmtPct(pct(t.unique_sent, leadsTotal))} of leads` : ""}`, width: pct(t.unique_sent, scale) },
-      { label: "Opened", value: t.unique_opened, color: "--opened", note: `${fmtPct(pct(t.unique_opened, base))} open rate`, width: pct(t.unique_opened, scale) },
-      { label: "Clicked", value: t.clicked, color: "--clicked", note: `${fmtPct(pct(t.clicked, base))} click rate`, width: pct(t.clicked, scale) },
-      { label: "Replied", value: t.replied, color: "--replied", note: `${fmtPct(pct(t.replied, base))} reply rate`, width: pct(t.replied, scale) },
+        note: period
+          ? `${fmt.format(t.unique_sent)} new leads contacted`
+          : `${fmt.format(t.unique_sent)} leads contacted${leadsTotal ? ` · ${fmtPct(pct(t.unique_sent, leadsTotal))} of leads` : ""}`,
+        width: pct(t.unique_sent, scale) },
+      { label: "Opened", value: t.unique_opened, color: "--opened",
+        note: period ? "leads opening for the first time" : `${fmtPct(pct(t.unique_opened, base))} open rate`,
+        width: pct(t.unique_opened, scale) },
+      { label: "Clicked", value: t.clicked, color: "--clicked",
+        note: `${fmtPct(pct(t.clicked, base))} ${period ? "of emails sent" : "click rate"}`, width: pct(t.clicked, scale) },
+      { label: "Replied", value: t.replied, color: "--replied",
+        note: `${fmtPct(pct(t.replied, base))} ${period ? "of emails sent" : "reply rate"}`, width: pct(t.replied, scale) },
     ];
     $("funnel").innerHTML = stages.map((s) => `
       <div class="stage" style="--c: var(${s.color})">
@@ -324,12 +405,16 @@
     const everyCampaign = data.campaigns || [];
     const active = everyCampaign.filter((c) => c.status === "ACTIVE").length;
     const paused = everyCampaign.filter((c) => c.status === "PAUSED").length;
-    const periodLabel = state.range === "all" ? "all time" : `last ${state.range} days (incl. today)`;
+    const periodLabel = period ? `last ${state.range} days (incl. today)` : "all time";
+    const periodSub = [
+      rows.length !== everyCampaign.length ? `${rows.length} campaign${rows.length === 1 ? "" : "s"} with activity` : "",
+      period ? "rates are per email sent" : "rates are per lead contacted",
+    ].filter(Boolean).join("<br>");
     $("side-stats").innerHTML = `
       <div class="highlight"><dt>Active campaigns</dt><dd>${active}<small>of ${everyCampaign.length} total${paused ? ` · ${paused} paused` : ""}</small></dd></div>
       <div><dt>Bounced</dt><dd>${fmt.format(t.bounced)}<small>${fmtPct(pct(t.bounced, t.sent))}</small></dd></div>
       <div><dt>Unsubscribed</dt><dd>${fmt.format(t.unsubscribed)}<small>${fmtPct(pct(t.unsubscribed, base))}</small></dd></div>
-      <div><dt>Period</dt><dd style="font-size:1rem;font-weight:400">${periodLabel}${rows.length !== everyCampaign.length ? `<br><small style="margin:0">${rows.length} campaign${rows.length === 1 ? "" : "s"} with activity</small>` : ""}</dd></div>`;
+      <div><dt>Period</dt><dd style="font-size:1rem;font-weight:400">${periodLabel}<br><small style="margin:0">${periodSub}</small></dd></div>`;
   }
 
   // Chart buckets: day, week of the month (1–7, 8–14, 15–21, 22–28, 29–end), or month
@@ -372,7 +457,7 @@
 
     // Sum each day, then group into weeks if asked
     const perDay = days.map((day) => {
-      const s = { date: day.date, sent: 0, unique_opened: 0, clicked: 0, replied: 0 };
+      const s = { date: day.date, sent: 0, unique_opened: 0, clicked: 0, replied: 0, late: Boolean(day.late), lateNote: day.late ? lateText(day) : "" };
       for (const [id, d] of Object.entries(day.campaigns)) {
         if (filterIds && !filterIds.has(id)) continue;
         s.sent += d.sent; s.unique_opened += d.unique_opened; s.clicked += d.clicked; s.replied += d.replied;
@@ -384,8 +469,9 @@
     const map = new Map();
     for (const d of perDay) {
       const info = bucketOf(d.date, g);
-      const bk = map.get(info.key) || { ...info, sent: 0, unique_opened: 0, clicked: 0, replied: 0, days: 0 };
+      const bk = map.get(info.key) || { ...info, sent: 0, unique_opened: 0, clicked: 0, replied: 0, days: 0, lateDays: 0, lateNote: "" };
       bk.sent += d.sent; bk.unique_opened += d.unique_opened; bk.clicked += d.clicked; bk.replied += d.replied; bk.days++;
+      if (d.late) { bk.lateDays++; bk.lateNote = d.lateNote; }
       map.set(info.key, bk);
     }
     const buckets = [...map.values()];
@@ -395,7 +481,7 @@
     const labels = buckets.map((b, i) => `${b.label}${i === buckets.length - 1 && todayLive ? ` (${currentWord})` : ""}`);
     const sum = (k) => buckets.reduce((a, b) => a + b[k], 0);
     $("trend-sub").textContent =
-      `${fmt.format(sum("sent"))} sent · ${fmt.format(sum("unique_opened"))} opened · ${fmt.format(sum("replied"))} replies` +
+      `${fmt.format(sum("sent"))} sent · ${fmt.format(sum("unique_opened"))} new openers · ${fmt.format(sum("replied"))} replies` +
       (todayLive ? ` · ${currentWord} so far is live` : "");
 
     const ink = cssVar("--muted");
@@ -417,7 +503,7 @@
         labels,
         datasets: [
           ds("Sent", "sent", cssVar("--sent"), "y"),
-          ds("Opened (unique)", "unique_opened", cssVar("--opened"), "y"),
+          ds("New openers", "unique_opened", cssVar("--opened"), "y"),
           ds("Clicks", "clicked", cssVar("--clicked"), "y2"),
           ds("Replies", "replied", cssVar("--replied"), "y2"),
         ],
@@ -437,8 +523,14 @@
               label: (c) => ` ${c.dataset.label}: ${fmt.format(c.parsed.y)}`,
               afterBody: (items) => {
                 const b = buckets[items[0].dataIndex];
-                const rate = b.sent ? ` · open rate ${fmtPct(pct(b.unique_opened, b.sent))}` : "";
-                return grouped ? `${b.days} day${b.days === 1 ? "" : "s"} of data${rate}` : rate.replace(" · ", "");
+                const lines = [];
+                const rate = b.sent ? `replies ${fmtPct(pct(b.replied, b.sent))} of emails sent` : "";
+                if (grouped) lines.push(`${b.days} day${b.days === 1 ? "" : "s"} of data${rate ? ` · ${rate}` : ""}`);
+                else if (rate) lines.push(rate);
+                if (b.lateDays) {
+                  lines.push(grouped ? `⚠ ${b.lateDays} day${b.lateDays === 1 ? "" : "s"} with shifted boundaries` : `⚠ ${b.lateNote}`);
+                }
+                return lines;
               },
             },
           },
@@ -450,9 +542,9 @@
             grid: { display: false }, border: { color: rule },
           },
           y: { beginAtZero: true, ticks: { color: ink, precision: 0 }, grid: { color: rule }, border: { display: false },
-               title: { display: true, text: "Sent / opened", color: ink } },
+            title: { display: true, text: "Sent / opened", color: ink } },
           y2: { position: "right", beginAtZero: true, ticks: { color: ink, precision: 0 }, grid: { display: false }, border: { display: false },
-                title: { display: true, text: "Clicks / replies", color: ink } },
+            title: { display: true, text: "Clicks / replies", color: ink } },
         },
       },
     };
@@ -477,8 +569,12 @@
       th.setAttribute("aria-sort", th.dataset.key === k ? (sortDir === "asc" ? "ascending" : "descending") : "none");
     });
 
+    const period = state.range !== "all";
     const n = (v) => fmt.format(v || 0);
     const p = (v) => (v == null ? `<td class="na">–</td>` : `<td>${fmtPct(v)}</td>`);
+    const openRateCell = (r) => (period && !r.plain_text
+      ? `<td class="na" title="Not shown for a period: it would compare different groups of leads">–</td>`
+      : p(r.open_rate));
     $("campaign-table").querySelector("tbody").innerHTML = list.map((r) => `
       <tr>
         <td class="text name">${esc(r.name)}</td>
@@ -487,7 +583,7 @@
         <td>${r.leads_not_started == null ? `<span class="na">–</span>` : n(r.leads_not_started)}</td>
         <td>${n(r.sent)}</td>
         ${r.plain_text ? `<td class="na" title="Plain-text campaign: opens not tracked">–</td>` : `<td>${n(r.unique_opened)}</td>`}
-        ${p(r.open_rate)}
+        ${openRateCell(r)}
         <td>${n(r.clicked)}</td>
         <td>${n(r.replied)}</td>
         ${p(r.reply_rate)}
@@ -504,11 +600,11 @@
 
   function exportCsv() {
     const byId = Object.fromEntries((data.campaigns || []).map((c) => [String(c.id), c]));
+    const allTime = state.range === "all";
     const rows = currentRows()
       .filter((r) => !state.search || r.name.toLowerCase().includes(state.search))
       .map((r) => ({ ...byId[String(r.id)], ...r })); // add campaign details (created, lead stats) in period views
-    const allTime = state.range === "all";
-    const ist = (t) => (t ? new Date(t).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true }) : "");
+    const ist = (t) => (t ? new Date(t).toLocaleString("en-IN", { timeZone: TIME_ZONE, day: "2-digit", month: "short", year: "numeric", hour: "numeric", minute: "2-digit", hour12: true }) : "");
     const p = (v) => (v == null ? "" : `${(v * 100).toFixed(2)}%`);
     const cell = (v) => {
       const str = v == null ? "" : String(v);
@@ -527,21 +623,21 @@
       ["Completed", (r) => r.leads_completed],
       ["Blocked", (r) => r.leads_blocked],
       ["Emails sent", (r) => r.sent],
-      ["Leads contacted", (r) => r.unique_sent],
-      ["% of leads contacted", (r) => p(pct(r.unique_sent, r.leads_total))],
+      [allTime ? "Leads contacted" : "New leads contacted", (r) => r.unique_sent],
+      ["% of leads contacted", (r) => (allTime ? p(pct(r.unique_sent, r.leads_total)) : "")],
       ["Opens (total)", (r) => (allTime ? r.opened : "")],
-      ["Unique opens", (r) => (r.plain_text ? "" : r.unique_opened)],
+      [allTime ? "Unique opens" : "New openers", (r) => (r.plain_text ? "" : r.unique_opened)],
       ["Open rate", (r) => p(r.open_rate)],
       ["Clicks", (r) => r.clicked],
       ["Unique clicks", (r) => (allTime ? r.unique_clicked : "")],
-      ["Click rate", (r) => p(pct(r.clicked, r.unique_sent))],
+      ["Click rate", (r) => p(r.click_rate)],
       ["Replies", (r) => r.replied],
       ["Reply rate", (r) => p(r.reply_rate)],
       ["Interested leads", (r) => r.leads_interested],
       ["Bounced", (r) => r.bounced],
       ["Bounce rate", (r) => p(r.bounce_rate)],
       ["Unsubscribed", (r) => r.unsubscribed],
-      ["Unsubscribe rate", (r) => p(pct(r.unsubscribed, r.unique_sent))],
+      ["Unsubscribe rate", (r) => p(r.unsub_rate)],
       ["Plain text (no open tracking)", (r) => (r.plain_text ? "Yes" : "No")],
     ];
 
@@ -549,15 +645,14 @@
     const sumKeys = ["leads_total", "leads_not_started", "leads_in_progress", "leads_completed", "leads_blocked", "sent", "unique_sent",
       "opened", "unique_opened", "clicked", "unique_clicked", "replied", "leads_interested", "bounced", "unsubscribed"];
     const T = Object.fromEntries(sumKeys.map((k) => [k, rows.reduce((a, r) => a + (Number(r[k]) || 0), 0)]));
-    Object.assign(T, {
-      name: "TOTAL", id: "", status: "", created_at: null,
-      open_rate: pct(T.unique_opened, T.unique_sent), reply_rate: pct(T.replied, T.unique_sent), bounce_rate: pct(T.bounced, T.sent),
-    });
+    const TR = withRates({ ...T, plain_text: false }, !allTime);
+    Object.assign(TR, { name: "TOTAL", id: "", status: "", created_at: null });
 
     const periodText = allTime ? "All time" : `Last ${state.range} days including today (IST)`;
     const out = [
       line(["Smartlead campaign report"]),
       line(["Period", periodText]),
+      line(["Rates", allTime ? "Per lead contacted (bounce rate per email sent)" : "Per email sent in the period; open rate isn't shown for a period"]),
       line(["Status filter", state.status ? titleCase(state.status) : "All statuses"]),
       line(["Data as of (IST)", ist(data.updated_at)]),
       line(["Exported at (IST)", ist(new Date().toISOString())]),
@@ -565,7 +660,7 @@
       "",
       line(cols.map(([h]) => h)),
       ...rows.map((r) => line(cols.map(([, f]) => f(r)))),
-      line(cols.map(([h, f]) => (h === "Plain text (no open tracking)" ? "" : f(T)))),
+      line(cols.map(([h, f]) => (h === "Plain text (no open tracking)" ? "" : f(TR)))),
     ];
 
     const stamp = new Date().toISOString().slice(0, 10);
