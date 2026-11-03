@@ -1,13 +1,17 @@
 # .github/workflows/daily-sync.yml
-# Saves one snapshot per day just after midnight IST.
-# The dashboard is live on its own; this only builds the history for daily trends.
+# Saves one snapshot per day at midnight IST and, if turned on, yesterday's report.
+#
+# GitHub's own schedule often starts hours late, which shifts the day boundaries.
+# The real trigger is an outside scheduler (e.g. cron-job.org) calling "workflow_dispatch"
+# at 00:05 IST. The schedule below is only a backup: if the outside trigger already ran,
+# today's snapshot exists and the backup run leaves it unchanged.
 name: Daily Smartlead sync
 
 on:
-  schedule:
-    # 18:35 UTC = 00:05 IST, every day
-    - cron: "35 18 * * *"
   workflow_dispatch: {}
+  schedule:
+    # 18:35 UTC = 00:05 IST (backup only; GitHub may run it hours late)
+    - cron: "35 18 * * *"
 
 permissions:
   contents: write
@@ -32,6 +36,15 @@ jobs:
           SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
           DASHBOARD_TIME_ZONE: Asia/Kolkata
         run: node scripts/fetch-smartlead.mjs
+
+      - name: Save yesterday's report
+        # Only runs when the repository variable SAVE_REPORTS is "true".
+        # Turn it on only after the repo is private: these files contain lead emails and replies.
+        continue-on-error: true
+        env:
+          SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+          SAVE_REPORTS: ${{ vars.SAVE_REPORTS }}
+        run: node scripts/build-reports.mjs
 
       - name: Commit updated data
         run: |
